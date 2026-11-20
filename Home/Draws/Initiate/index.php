@@ -10,35 +10,6 @@ $today_date = date('Y-m-d');
 
 const REQUIRED_SNAPSHOT_COUNT = 3;
 
-// Decode previously persisted photo paths from hidden input (JSON array)
-$saved_photos = ['', '', ''];
-if (!empty($_POST['existing_photos_json'])) {
-    $decoded = json_decode((string)$_POST['existing_photos_json'], true);
-    if (is_array($decoded)) {
-        for ($i = 0; $i < REQUIRED_SNAPSHOT_COUNT; $i++) {
-            $saved_photos[$i] = isset($decoded[$i]) ? trim((string)$decoded[$i]) : '';
-        }
-    }
-}
-
-// Ensure current verifier email and full name are in session
-if (empty($_SESSION['user_email']) || empty($_SESSION['user_name'])) {
-    $u_stmt = $pdo->prepare("SELECT email, full_name FROM users WHERE id = ?");
-    $u_stmt->execute([$_SESSION['user_id']]);
-    $u_data = $u_stmt->fetch();
-    if ($u_data) {
-        $_SESSION['user_email'] = $u_data['email'];
-        $_SESSION['user_name'] = $u_data['full_name'];
-    }
-}
-
-// Fetch already-recorded draw dates (one draw per day rule)
-$taken_dates = [];
-$date_stmt = $pdo->query("SELECT DISTINCT draw_date FROM draws WHERE draw_date IS NOT NULL ORDER BY draw_date DESC");
-while ($row_date = $date_stmt->fetch(PDO::FETCH_COLUMN)) {
-    $taken_dates[] = $row_date;
-}
-
 // Helper to normalize stored DB photo column (supports legacy single string or JSON array)
 $parse_db_photos = function ($raw_val) {
     $out = ['', '', ''];
@@ -59,6 +30,76 @@ $parse_db_photos = function ($raw_val) {
     return $out;
 };
 
+// Optional draft/draw resume lookup via GET (?resume=... or ?draft_id=... or ?id=...)
+$resume_key = trim((string)($_GET['resume'] ?? ($_GET['draft_id'] ?? ($_GET['id'] ?? ''))));
+$resume_draw = null;
+if ($resume_key !== '') {
+    $r_stmt = $pdo->prepare("
+        SELECT * FROM draws
+        WHERE (id = :num_id AND :is_num = 1) OR draw_hash_code = :hash OR certificate_ref = :ref
+        LIMIT 1
+    ");
+    $r_stmt->execute([
+        ':num_id' => ctype_digit($resume_key) ? (int)$resume_key : 0,
+        ':is_num' => ctype_digit($resume_key) ? 1 : 0,
+        ':hash'   => $resume_key,
+        ':ref'    => $resume_key,
+    ]);
+    $found_draw = $r_stmt->fetch(PDO::FETCH_ASSOC);
+    if ($found_draw && in_array((string)($found_draw['status'] ?? ''), ['DRAFT', 'IN_PROGRESS'], true)) {
+        $resume_draw = $found_draw;
+    }
+}
+
+// Decode previously persisted photo paths from hidden input (JSON array) or resumed draft
+$saved_photos = ['', '', ''];
+if (!empty($_POST['existing_photos_json'])) {
+    $decoded = json_decode((string)$_POST['existing_photos_json'], true);
+    if (is_array($decoded)) {
+        for ($i = 0; $i < REQUIRED_SNAPSHOT_COUNT; $i++) {
+            $saved_photos[$i] = isset($decoded[$i]) ? trim((string)$decoded[$i]) : '';
+        }
+    }
+} elseif ($resume_draw && !empty($resume_draw['central_system_photo'])) {
+    $saved_photos = $parse_db_photos($resume_draw['central_system_photo']);
+}
+
+// Ensure current verifier email and full name are in session
+if (empty($_SESSION['user_email']) || empty($_SESSION['user_name'])) {
+    $u_stmt = $pdo->prepare("SELECT email, full_name FROM users WHERE id = ?");
+    $u_stmt->execute([$_SESSION['user_id']]);
+    $u_data = $u_stmt->fetch();
+    if ($u_data) {
+        $_SESSION['user_email'] = $u_data['email'];
+        $_SESSION['user_name'] = $u_data['full_name'];
+    }
+}
+
+// Active draw identifier being created or resumed
+$active_draw_id = trim((string)($_POST['draw_id'] ?? ($resume_draw['id'] ?? '')));
+
+// Fetch already-recorded draw dates (excluding the active draft/in-progress draw being resumed)
+$taken_dates = [];
+if ($active_draw_id !== '') {
+    $date_stmt = $pdo->prepare("
+        SELECT DISTINCT draw_date
+        FROM draws
+        WHERE draw_date IS NOT NULL
+          AND id != :exclude_id
+          AND draw_hash_code != :exclude_hash
+        ORDER BY draw_date DESC
+    ");
+    $date_stmt->execute([
+        ':exclude_id'   => $active_draw_id,
+        ':exclude_hash' => $active_draw_id,
+    ]);
+} else {
+    $date_stmt = $pdo->query("SELECT DISTINCT draw_date FROM draws WHERE draw_date IS NOT NULL ORDER BY draw_date DESC");
+}
+while ($row_date = $date_stmt->fetch(PDO::FETCH_COLUMN)) {
+    $taken_dates[] = $row_date;
+}
+
 // Helper to persist all 3 snapshot slots safely to /uploads/ and sync with draft
 $persist_all_snapshots = function ($draw_id_val, array $current_saved) use ($pdo, $parse_db_photos) {
     $draw_id_str = trim((string)$draw_id_val);
@@ -69,8 +110,8 @@ $persist_all_snapshots = function ($draw_id_val, array $current_saved) use ($pdo
 
     // Fallback to DB draft photos if hidden field wasn't populated yet
     if ($draw_id_str !== '') {
-        $ph_stmt = $pdo->prepare("SELECT central_system_photo FROM draws WHERE id = ?");
-        $ph_stmt->execute([$draw_id_str]);
+        $ph_stmt = $pdo->prepare("SELECT central_system_photo FROM draws WHERE id = ? OR draw_hash_code = ? LIMIT 1");
+        $ph_stmt->execute([$draw_id_str, $draw_id_str]);
         $db_raw = $ph_stmt->fetchColumn();
         $db_paths = $parse_db_photos($db_raw);
         for ($i = 0; $i < REQUIRED_SNAPSHOT_COUNT; $i++) {
@@ -107,8 +148,8 @@ $persist_all_snapshots = function ($draw_id_val, array $current_saved) use ($pdo
     }
 
     if ($draw_id_str !== '' && ($any_new_upload || array_filter($final_paths))) {
-        $pdo->prepare("UPDATE draws SET central_system_photo = ? WHERE id = ?")
-            ->execute([json_encode($final_paths), $draw_id_str]);
+        $pdo->prepare("UPDATE draws SET central_system_photo = ? WHERE id = ? OR draw_hash_code = ?")
+            ->execute([json_encode($final_paths), $draw_id_str, $draw_id_str]);
     }
 
     return $final_paths;
@@ -125,7 +166,7 @@ $count_attached_snapshots = function (array $paths) {
     return $cnt;
 };
 
-// 1. Handle AJAX Draft Creation Request (Before any HTML output)
+// 1. Handle AJAX Draft Creation / Resume Request (Before any HTML output)
 if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'create_draft') {
     ini_set('display_errors', 0);
     error_reporting(0);
@@ -133,6 +174,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'create_draft') {
     header('Content-Type: application/json');
 
     try {
+        $existing_draw_id = trim((string)($_POST['draw_id'] ?? ''));
         $draw_date = trim($_POST['draw_date'] ?? date('Y-m-d'));
         $draw_session = trim($_POST['draw_session'] ?? 'Unnamed Session');
         $time_only = trim($_POST['start_time'] ?? date('H:i:s'));
@@ -142,10 +184,31 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'create_draft') {
             exit;
         }
 
-        // Enforce 1 draw per day rule
-        $chk_dup = $pdo->prepare("SELECT id, certificate_ref FROM draws WHERE draw_date = ? LIMIT 1");
+        // If already working on a draft/in-progress draw, update it cleanly instead of blocking
+        if ($existing_draw_id !== '') {
+            $chk_self = $pdo->prepare("SELECT id, certificate_ref, status FROM draws WHERE id = ? OR draw_hash_code = ? LIMIT 1");
+            $chk_self->execute([$existing_draw_id, $existing_draw_id]);
+            if ($self_row = $chk_self->fetch(PDO::FETCH_ASSOC)) {
+                if (in_array((string)$self_row['status'], ['DRAFT', 'IN_PROGRESS'], true)) {
+                    $start_datetime = $draw_date . ' ' . $time_only;
+                    $pdo->prepare("UPDATE draws SET draw_date = ?, draw_session = ?, start_time = ? WHERE id = ?")
+                        ->execute([$draw_date, $draw_session, $start_datetime, $self_row['id']]);
+                    echo json_encode([
+                        'status'     => 'success',
+                        'draw_id'    => (string)$self_row['id'],
+                        'ref'        => (string)$self_row['certificate_ref'],
+                        'start_time' => $time_only,
+                        'resumed'    => true,
+                    ]);
+                    exit;
+                }
+            }
+        }
+
+        // Enforce 1 draw per day rule against OTHER draws
+        $chk_dup = $pdo->prepare("SELECT id, certificate_ref, status FROM draws WHERE draw_date = ? LIMIT 1");
         $chk_dup->execute([$draw_date]);
-        if ($existing_draw = $chk_dup->fetch()) {
+        if ($existing_draw = $chk_dup->fetch(PDO::FETCH_ASSOC)) {
             echo json_encode([
                 'status'  => 'error',
                 'message' => "A draw is already recorded for {$draw_date} (Ref: {$existing_draw['certificate_ref']}). Only one draw per day is permitted."
@@ -188,11 +251,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['ajax_action'])) {
     $draw_date = trim($_POST['draw_date'] ?? '');
     $today = date('Y-m-d');
 
-    // Enforce 1 draw per day (excluding current draft's own ID if present)
+    // Enforce 1 draw per day (excluding current draft's own ID/hash if present)
     $dup_sql = "SELECT id, certificate_ref FROM draws WHERE draw_date = ?";
     $dup_params = [$draw_date];
     if ($draw_id !== '') {
-        $dup_sql .= " AND id != ?";
+        $dup_sql .= " AND id != ? AND draw_hash_code != ?";
+        $dup_params[] = $draw_id;
         $dup_params[] = $draw_id;
     }
     $dup_sql .= " LIMIT 1";
@@ -336,7 +400,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['ajax_action'])) {
                         num1_a = ?, num2_a = ?, num3_a = ?, num4_a = ?, num5_a = ?, 
                         num1_b = ?, num2_b = ?, num3_b = ?, num4_b = ?, num5_b = ?, central_system_photo = ?, 
                         status = 'PENDING_PARTNER_APPROVAL', verifier_signed_at = NOW() 
-                        WHERE id = ?");
+                        WHERE id = ? OR draw_hash_code = ?");
 
                     $stmt->execute([
                         $draw_date, $_POST['draw_session'], $start_datetime, $end_datetime,
@@ -344,7 +408,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['ajax_action'])) {
                         isset($_POST['chk_pre']) ? 1 : 0, isset($_POST['chk_obs']) ? 1 : 0, isset($_POST['chk_post']) ? 1 : 0,
                         $_POST['procedure_notes'], $exception_status, $exception_report_ref, $exception_details,
                         $set_a[0], $set_a[1], $set_a[2], $set_a[3], $set_a[4],
-                        $set_b[0], $set_b[1], $set_b[2], $set_b[3], $set_b[4], $photos_json, $draw_id
+                        $set_b[0], $set_b[1], $set_b[2], $set_b[3], $set_b[4], $photos_json, $draw_id, $draw_id
                     ]);
                 } else {
                     $ref = generate_reference($pdo, $draw_date);
@@ -396,6 +460,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['ajax_action'])) {
         }
     }
 }
+
+// Resolve initial values from POST, resumed DB draft, or defaults
+$val_draw_id      = (string)($_POST['draw_id'] ?? ($resume_draw['id'] ?? ''));
+$val_draw_date    = (string)($_POST['draw_date'] ?? ($resume_draw['draw_date'] ?? $today_date));
+$val_draw_session = (string)($_POST['draw_session'] ?? ($resume_draw['draw_session'] ?? ''));
+$val_start_time   = (string)($_POST['start_time'] ?? (!empty($resume_draw['start_time']) ? date('H:i:s', strtotime((string)$resume_draw['start_time'])) : ''));
+$val_end_time     = (string)($_POST['end_time'] ?? (!empty($resume_draw['end_time']) ? date('H:i:s', strtotime((string)$resume_draw['end_time'])) : ''));
+$val_venue        = (string)($_POST['venue'] ?? ($resume_draw['venue_location'] ?? 'Rwanda Broadcasting Agency (RBA) Studio, Kacyiru'));
+$val_lat          = (string)($_POST['lat'] ?? ($resume_draw['gps_latitude'] ?? ''));
+$val_lng          = (string)($_POST['lng'] ?? ($resume_draw['gps_longitude'] ?? ''));
+
+$chk_pre_val  = isset($_POST['chk_pre']) ? true : (!empty($resume_draw['chk_pre_draw']));
+$chk_obs_val  = isset($_POST['chk_obs']) ? true : (!empty($resume_draw['chk_draw_obs']));
+$chk_post_val = isset($_POST['chk_post']) ? true : (!empty($resume_draw['chk_post_draw']));
+
+$curr_exc_status = (string)($_POST['exception_status'] ?? ($resume_draw['exception_status'] ?? 'NONE'));
+$curr_exc_ref    = (string)($_POST['exception_report_ref'] ?? ($resume_draw['exception_report_ref'] ?? ''));
+$curr_exc_desc   = (string)($_POST['exception_details'] ?? ($resume_draw['exception_details'] ?? ''));
+
+$default_conclusion = "Based on the procedures performed and the evidence obtained, the scheduled draw was observed and the results verified against the agreed records. No significant exception was identified in the procedures covered by this verification.";
+$val_notes = (string)($_POST['procedure_notes'] ?? ($resume_draw['procedure_notes'] ?? $default_conclusion));
 
 // 3. Include HTML Layout Headers
 $page_title = "Initiate Draw Verification | LDC System";
@@ -534,6 +619,11 @@ $slot_labels = [
         return TAKEN_DRAW_DATES.has(dateStr);
     }
 
+    function hasActiveDraftSession() {
+        const drawIdEl = document.getElementById('draw_id');
+        return !!(drawIdEl && drawIdEl.value.trim() !== '');
+    }
+
     function setRemainingFieldsDisabled(disabledState) {
         const container = document.getElementById('draw-details-fields');
         if (!container) return;
@@ -556,12 +646,14 @@ $slot_labels = [
         const nonTodayBanner = document.getElementById('non-today-banner');
         const nonTodayText = document.getElementById('non-today-text');
         const startBtn = document.getElementById('start-session-btn');
-        const drawIdVal = document.getElementById('draw_id') ? document.getElementById('draw_id').value.trim() : '';
+        const isResumingDraft = hasActiveDraftSession();
 
         if (!dateInput) return;
         const chosen = dateInput.value;
 
-        if (chosen && isDateTaken(chosen) && drawIdVal === '') {
+        // Only block when starting a brand-new draw on an already-taken date;
+        // if resuming/editing an existing draft/in-progress draw, keep date & fields editable
+        if (chosen && isDateTaken(chosen) && !isResumingDraft) {
             if (nonTodayBanner) nonTodayBanner.style.display = 'none';
             if (takenBanner && takenText) {
                 takenText.textContent = 'A draw is already recorded for ' + chosen + '. Only one draw per day is permitted—please select an available date before proceeding.';
@@ -583,7 +675,7 @@ $slot_labels = [
         }
 
         if (chosen && chosen !== TODAY_DATE) {
-            if (interactive) {
+            if (interactive && !isResumingDraft) {
                 const proceed = confirm(
                     "DATE NOTICE: You are choosing " + chosen + ", which is NOT today's date (" + TODAY_DATE + ").\n\n" +
                     "Click OK to confirm you intend to log a draw for " + chosen + " before proceeding with other fields, or Cancel to reset to today's date."
@@ -721,12 +813,14 @@ $slot_labels = [
 
     function startDrawSession() {
         const chosenDate = document.getElementById('draw_date').value;
+        const isResumingDraft = hasActiveDraftSession();
+
         if (!chosenDate) {
             alert("Please select a Draw Date first.");
             document.getElementById('draw_date').focus();
             return;
         }
-        if (isDateTaken(chosenDate)) {
+        if (isDateTaken(chosenDate) && !isResumingDraft) {
             alert("A draw already exists for " + chosenDate + ". Only one draw per day is permitted.");
             document.getElementById('draw_date').focus();
             return;
@@ -740,15 +834,19 @@ $slot_labels = [
         }
 
         if (confirm("SMART WARNING: Clicking OK records the exact live start timestamp and saves a secure draft in the database. Proceed?")) {
+            const existingStart = document.getElementById('start_time').value.trim();
             const now = new Date();
-            const timeString = String(now.getHours()).padStart(2, '0') + ':' +
-                               String(now.getMinutes()).padStart(2, '0') + ':' +
-                               String(now.getSeconds()).padStart(2, '0');
+            const timeString = existingStart || (
+                String(now.getHours()).padStart(2, '0') + ':' +
+                String(now.getMinutes()).padStart(2, '0') + ':' +
+                String(now.getSeconds()).padStart(2, '0')
+            );
 
             document.getElementById('start_time').value = timeString;
 
             const formData = new FormData();
             formData.append('ajax_action', 'create_draft');
+            formData.append('draw_id', document.getElementById('draw_id').value.trim());
             formData.append('draw_date', chosenDate);
             formData.append('draw_session', sessionName);
             formData.append('start_time', timeString);
@@ -776,14 +874,15 @@ $slot_labels = [
                     document.getElementById('end-session-btn').style.opacity = '1';
                     document.getElementById('session-started-badge').style.display = 'inline-block';
                     document.getElementById('session-saved-notice').innerHTML = '<i class="fa-solid fa-cloud-arrow-up" style="color: var(--jade);"></i> Draft securely saved (Ref: ' + data.ref + ')';
+                    handleDrawDateChange(false);
                     saveFormBackup();
                 } else {
-                    document.getElementById('start_time').value = '';
+                    if (!existingStart) document.getElementById('start_time').value = '';
                     alert("Draft creation error: " + (data.message || 'Unknown error'));
                 }
             })
             .catch(err => {
-                document.getElementById('start_time').value = '';
+                if (!existingStart) document.getElementById('start_time').value = '';
                 console.error("Draft sync error:", err);
                 alert("Draft Error: " + err.message);
             });
@@ -837,7 +936,6 @@ $slot_labels = [
         }
     }
 
-    // Trigger instant camera capture on mobile for a specific snapshot slot
     function triggerInstantCamera(slotIdx) {
         const inp = document.getElementById('snapshot_file_' + slotIdx);
         if (inp) {
@@ -936,7 +1034,7 @@ $slot_labels = [
                 const notesEl = document.querySelector('textarea[name="procedure_notes"]');
 
                 if (drawIdEl && !drawIdEl.value && data.draw_id) drawIdEl.value = String(data.draw_id);
-                if (drawDateEl && data.draw_date && !<?= isset($_POST['draw_date']) ? 'true' : 'false' ?>) {
+                if (drawDateEl && data.draw_date && !<?= isset($_POST['draw_date']) || $resume_draw ? 'true' : 'false' ?>) {
                     drawDateEl.value = data.draw_date;
                 }
                 if (sessionEl && !sessionEl.value && data.draw_session) sessionEl.value = data.draw_session;
@@ -958,7 +1056,7 @@ $slot_labels = [
                     });
                 }
 
-                if (data.exception_status) {
+                if (data.exception_status && !<?= isset($_POST['exception_status']) || $resume_draw ? 'true' : 'false' ?>) {
                     const radio = document.querySelector('input[name="exception_status"][value="' + data.exception_status + '"]');
                     if (radio) radio.checked = true;
                 }
@@ -1024,7 +1122,11 @@ $slot_labels = [
                 <i class="fa-solid fa-rotate"></i> Retry GPS
             </button>
         </div>
-        <span id="session-saved-notice" style="font-size: 0.8rem; font-weight: bold; color: var(--slate);"></span>
+        <span id="session-saved-notice" style="font-size: 0.8rem; font-weight: bold; color: var(--slate);">
+            <?php if ($resume_draw): ?>
+                <i class="fa-solid fa-rotate-left" style="color: var(--jade);"></i> Resuming <?= htmlspecialchars((string)$resume_draw['status']) ?> (Ref: <?= htmlspecialchars((string)$resume_draw['certificate_ref']) ?>)
+            <?php endif; ?>
+        </span>
     </div>
 
     <?php if ($error): ?>
@@ -1052,19 +1154,19 @@ $slot_labels = [
     </div>
 
     <form method="POST" enctype="multipart/form-data" style="background: #fff; padding: 20px; border: 1px solid var(--pale-charcoal); border-radius: 4px;">
-        <input type="hidden" name="draw_id" id="draw_id" value="<?= htmlspecialchars($_POST['draw_id'] ?? '') ?>">
+        <input type="hidden" name="draw_id" id="draw_id" value="<?= htmlspecialchars($val_draw_id) ?>">
         <input type="hidden" name="existing_photos_json" id="existing_photos_json" value="<?= htmlspecialchars(json_encode($saved_photos)) ?>">
-        <input type="hidden" name="lat" id="lat" value="<?= htmlspecialchars($_POST['lat'] ?? '') ?>">
-        <input type="hidden" name="lng" id="lng" value="<?= htmlspecialchars($_POST['lng'] ?? '') ?>">
+        <input type="hidden" name="lat" id="lat" value="<?= htmlspecialchars($val_lat) ?>">
+        <input type="hidden" name="lng" id="lng" value="<?= htmlspecialchars($val_lng) ?>">
 
-        <!-- Step 1: Draw Date Selection First -->
+        <!-- Step 1: Draw Date Selection (Editable while in Draft / In Progress) -->
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
             <div>
                 <label style="font-size: 0.85rem; font-weight: 600;">Draw Date <span style="color: var(--slate); font-weight: 400;">(1 draw per day max)</span></label>
                 <input type="date"
                        name="draw_date"
                        id="draw_date"
-                       value="<?= htmlspecialchars($_POST['draw_date'] ?? $today_date) ?>"
+                       value="<?= htmlspecialchars($val_draw_date) ?>"
                        max="<?= htmlspecialchars($today_date) ?>"
                        onchange="handleDrawDateChange(true); saveFormBackup();"
                        required
@@ -1077,7 +1179,7 @@ $slot_labels = [
             </div>
             <div>
                 <label style="font-size: 0.85rem; font-weight: 600;">Draw Session Name</label>
-                <input type="text" name="draw_session" id="draw_session" value="<?= htmlspecialchars($_POST['draw_session'] ?? '') ?>" placeholder="e.g. Intego 5/90 Evening Main Draw" required style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;">
+                <input type="text" name="draw_session" id="draw_session" value="<?= htmlspecialchars($val_draw_session) ?>" placeholder="e.g. Intego 5/90 Evening Main Draw" required style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;">
             </div>
         </div>
 
@@ -1088,11 +1190,11 @@ $slot_labels = [
                 <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; align-items: center;">
                     <div>
                         <label style="font-size: 0.85rem; font-weight: 600;">Start Time (Preserved)</label>
-                        <input type="text" name="start_time" id="start_time" value="<?= htmlspecialchars($_POST['start_time'] ?? '') ?>" required readonly style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px; background: #e9ecef;">
+                        <input type="text" name="start_time" id="start_time" value="<?= htmlspecialchars($val_start_time) ?>" required readonly style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px; background: #e9ecef;">
                     </div>
                     <div>
                         <label style="font-size: 0.85rem; font-weight: 600;">End Time (Preserved)</label>
-                        <input type="text" name="end_time" id="end_time" value="<?= htmlspecialchars($_POST['end_time'] ?? '') ?>" required readonly style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px; background: #e9ecef;">
+                        <input type="text" name="end_time" id="end_time" value="<?= htmlspecialchars($val_end_time) ?>" required readonly style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px; background: #e9ecef;">
                     </div>
                     <div style="display: flex; gap: 8px; align-items: flex-end; padding-top: 20px;">
                         <button type="button" id="start-session-btn" onclick="startDrawSession()" style="background: var(--jade); color: #fff; border: none; padding: 10px 14px; font-weight: bold; border-radius: 4px; cursor: pointer;">
@@ -1112,22 +1214,15 @@ $slot_labels = [
 
             <div style="margin-bottom: 15px;">
                 <label style="font-size: 0.85rem; font-weight: 600;">Venue Location</label>
-                <input type="text" name="venue" value="<?= htmlspecialchars($_POST['venue'] ?? 'Rwanda Broadcasting Agency (RBA) Studio, Kacyiru') ?>" required style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;">
+                <input type="text" name="venue" value="<?= htmlspecialchars($val_venue) ?>" required style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;">
             </div>
 
             <h4 style="margin-top: 25px; color: var(--burgundy); border-bottom: 2px solid var(--pale-charcoal); padding-bottom: 5px;">Procedure Checklist Confirmation</h4>
             <div style="margin: 15px 0; display: flex; flex-direction: column; gap: 10px;">
-                <label><input type="checkbox" name="chk_pre" value="1" <?= isset($_POST['chk_pre']) ? 'checked' : '' ?> required> Pre-draw machinery &amp; equipment verification completed per Game Rules</label>
-                <label><input type="checkbox" name="chk_obs" value="1" <?= isset($_POST['chk_obs']) ? 'checked' : '' ?> required> Live draw observation executed strictly per Live Draw SOPs</label>
-                <label><input type="checkbox" name="chk_post" value="1" <?= isset($_POST['chk_post']) ? 'checked' : '' ?> required> Post-draw reconciliation and audit completed successfully</label>
+                <label><input type="checkbox" name="chk_pre" value="1" <?= $chk_pre_val ? 'checked' : '' ?> required> Pre-draw machinery &amp; equipment verification completed per Game Rules</label>
+                <label><input type="checkbox" name="chk_obs" value="1" <?= $chk_obs_val ? 'checked' : '' ?> required> Live draw observation executed strictly per Live Draw SOPs</label>
+                <label><input type="checkbox" name="chk_post" value="1" <?= $chk_post_val ? 'checked' : '' ?> required> Post-draw reconciliation and audit completed successfully</label>
             </div>
-           
-
-            <?php
-            $curr_exc_status = $_POST['exception_status'] ?? 'NONE';
-            $curr_exc_ref    = $_POST['exception_report_ref'] ?? '';
-            $curr_exc_desc   = $_POST['exception_details'] ?? '';
-            ?>
 
             <h4 style="margin-top: 25px; color: var(--burgundy); border-bottom: 2px solid var(--pale-charcoal); padding-bottom: 5px;">
                 3. EXCEPTIONS IDENTIFIED
@@ -1176,15 +1271,16 @@ $slot_labels = [
                 <div>
                     <p style="font-size: 0.85rem; font-weight: 600; color: var(--charcoal); margin-bottom: 8px;"><i class="fa-solid fa-pen-nib"></i> Primary Record Entry (Set A):</p>
                     <div style="display: flex; gap: 8px;">
-                        <?php for($i=1; $i<=5; $i++): ?>
-                            <input type="number" name="n<?= $i ?>_a" id="seta_n<?= $i ?>" value="<?= htmlspecialchars($_POST['n'.$i.'_a'] ?? '') ?>" min="0" max="90" step="1" inputmode="numeric" pattern="[0-9]*" required placeholder="0-90" oninput="validateAndPreview(this, 'seta')" style="width: 65px; padding: 8px; text-align: center; font-weight: bold;">
+                        <?php for ($i = 1; $i <= 5; $i++): ?>
+                            <?php $n_a_val = $_POST['n'.$i.'_a'] ?? (isset($resume_draw['num'.$i.'_a']) && $resume_draw['num'.$i.'_a'] !== null ? (string)$resume_draw['num'.$i.'_a'] : ''); ?>
+                            <input type="number" name="n<?= $i ?>_a" id="seta_n<?= $i ?>" value="<?= htmlspecialchars($n_a_val) ?>" min="0" max="90" step="1" inputmode="numeric" pattern="[0-9]*" required placeholder="0-90" oninput="validateAndPreview(this, 'seta')" style="width: 65px; padding: 8px; text-align: center; font-weight: bold;">
                         <?php endfor; ?>
                     </div>
                 </div>
                 <div>
                     <p style="font-size: 0.75rem; color: var(--slate); margin-bottom: 4px; font-weight: bold;">Shiny Balls Preview (Set A):</p>
                     <div id="seta-balls-preview" style="display: flex; gap: 8px;">
-                        <?php for($i=1; $i<=5; $i++): ?>
+                        <?php for ($i = 1; $i <= 5; $i++): ?>
                             <div class="ball-preview ball-red">--</div>
                         <?php endfor; ?>
                     </div>
@@ -1195,8 +1291,9 @@ $slot_labels = [
                 <div>
                     <p style="font-size: 0.85rem; font-weight: 600; color: var(--charcoal); margin-bottom: 8px;"><i class="fa-solid fa-copy"></i> Independent Dual-Control Re-entry (Set B):</p>
                     <div style="display: flex; gap: 8px;">
-                        <?php for($i=1; $i<=5; $i++): ?>
-                            <input type="number" name="n<?= $i ?>_b" id="setb_n<?= $i ?>" value="<?= htmlspecialchars($_POST['n'.$i.'_b'] ?? '') ?>" min="0" max="90" step="1" inputmode="numeric" pattern="[0-9]*" required placeholder="0-90" oninput="validateAndPreview(this, 'setb')" style="width: 65px; padding: 8px; text-align: center; font-weight: bold;">
+                        <?php for ($i = 1; $i <= 5; $i++): ?>
+                            <?php $n_b_val = $_POST['n'.$i.'_b'] ?? (isset($resume_draw['num'.$i.'_b']) && $resume_draw['num'.$i.'_b'] !== null ? (string)$resume_draw['num'.$i.'_b'] : ''); ?>
+                            <input type="number" name="n<?= $i ?>_b" id="setb_n<?= $i ?>" value="<?= htmlspecialchars($n_b_val) ?>" min="0" max="90" step="1" inputmode="numeric" pattern="[0-9]*" required placeholder="0-90" oninput="validateAndPreview(this, 'setb')" style="width: 65px; padding: 8px; text-align: center; font-weight: bold;">
                         <?php endfor; ?>
                     </div>
                     <small style="color: var(--slate); font-size: 0.75rem;">Set B numbers must match Set A exactly (0–90).</small>
@@ -1204,7 +1301,7 @@ $slot_labels = [
                 <div>
                     <p style="font-size: 0.75rem; color: var(--slate); margin-bottom: 4px; font-weight: bold;">Shiny Balls Preview (Set B):</p>
                     <div id="setb-balls-preview" style="display: flex; gap: 8px;">
-                        <?php for($i=1; $i<=5; $i++): ?>
+                        <?php for ($i = 1; $i <= 5; $i++): ?>
                             <div class="ball-preview ball-red">--</div>
                         <?php endfor; ?>
                     </div>
@@ -1261,9 +1358,10 @@ $slot_labels = [
                     <?php endfor; ?>
                 </div>
             </div>
-             <div style="margin-bottom: 20px;">
+
+            <div style="margin-bottom: 20px;">
                 <label style="font-size: 0.85rem; font-weight: 600;">Verification Conclusion</label>
-                <textarea name="procedure_notes" rows="2" placeholder="Verification Conclusion" style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;"><?= htmlspecialchars($_POST['procedure_notes'] ?? '') ?>Based on the procedures performed and the evidence obtained, the scheduled draw was observed and the results verified against the agreed records. No significant exception was identified in the procedures covered by this verification. </textarea>
+                <textarea name="procedure_notes" rows="2" placeholder="Verification Conclusion" style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;"><?= htmlspecialchars($val_notes) ?></textarea>
             </div>
 
             <!-- MFA Step 1 vs Step 2 Submission Controls -->
