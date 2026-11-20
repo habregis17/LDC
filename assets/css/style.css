@@ -1,0 +1,88 @@
+@import url('https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css');
+@import url('https://fonts.cdnfonts.com/css/proxima-nova-2');
+
+:root {
+    --red: #E81A3B;
+    --charcoal: #333333;
+    --pale-charcoal: #E7E7E7;
+    --burgundy: #98002e;
+    --slate: #5b6e7f;
+    --ocean: #008fd2;
+    --gold: #D76900;
+    --jade: #009966;
+    --font-family: 'Proxima Nova', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; font-family: var(--font-family); }
+body { background-color: #f4f6f9; color: var(--charcoal); display: flex; flex-direction: column; min-height: 100vh; }
+
+/* Header */
+.app-header {
+    background-color: #ffffff;
+    border-bottom: 2px solid var(--pale-charcoal);
+    padding: 10px 15px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    position: sticky;
+    top: 0;
+    z-index: 1000;
+}
+.app-header .brand { display: flex; align-items: center; gap: 10px; }
+.app-header .brand h1 { font-size: 1.1rem; color: var(--red); font-weight: 700; }
+.app-header .brand span { font-size: 0.75rem; color: var(--slate); }
+.app-header .clock-display { font-size: 0.85rem; font-weight: 600; color: var(--charcoal); }
+
+/* Sidebar Navigation */
+.app-layout { display: flex; flex: 1; }
+.sidebar {
+    width: 240px;
+    background-color: var(--charcoal);
+    color: #ffffff;
+    display: flex;
+    flex-direction: column;
+    transition: transform 0.3s ease;
+}
+.sidebar-logo { padding: 15px; background: var(--burgundy); text-align: center; }
+.sidebar-logo img { max-width: 140px; height: auto; }
+.sidebar nav a {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 18px;
+    color: var(--pale-charcoal);
+    text-decoration: none;
+    font-size: 0.95rem;
+    border-left: 4px solid transparent;
+}
+.sidebar nav a:hover, .sidebar nav a.active {
+    background-color: rgba(255,255,255,0.05);
+    border-left-color: var(--red);
+    color: #ffffff;
+}
+
+/* Main Content Area */
+.main-content { flex: 1; padding: 20px; max-width: 1200px; margin: 0 auto; width: 100%; }
+
+/* Alerts without gradients */
+.alert { padding: 12px 15px; margin-bottom: 15px; font-size: 0.9rem; font-weight: 600; }
+.alert-error { background-color: var(--red); color: #ffffff; }
+.alert-success { background-color: var(--jade); color: #ffffff; }
+.alert-warning { background-color: var(--gold); color: #ffffff; }
+
+/* Custom Paged Tables */
+.table-container { background: #ffffff; border: 1px solid var(--pale-charcoal); overflow-x: auto; }
+.custom-table { width: 100%; border-collapse: collapse; text-align: left; }
+.custom-table th { background: var(--slate); color: #ffffff; padding: 10px; font-size: 0.85rem; }
+.custom-table td { padding: 10px; border-bottom: 1px solid var(--pale-charcoal); font-size: 0.85rem; }
+
+/* Mobile Optimizations */
+@media (max-width: 768px) {
+    .app-layout { flex-direction: column; }
+    .sidebar { width: 100%; }
+    .sidebar nav { display: flex; overflow-x: auto; }
+    .sidebar nav a { flex-direction: column; padding: 8px; font-size: 0.75rem; text-align: center; gap: 4px; }
+}
+
+/* Footer */
+.app-footer { background: var(--charcoal); color: var(--pale-charcoal); text-align: center; padding: 12px; font-size: 0.8rem; margin-top: auto; }
