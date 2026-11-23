@@ -40,7 +40,7 @@ $parse_db_photos = function ($raw_val) {
         return $out;
     }
     $trim_val = trim((string)$raw_val);
-    if (str_starts_with($trim_val, '[')) {
+   if (strpos($trim_val, '[') === 0) {
         $arr = json_decode($trim_val, true);
         if (is_array($arr)) {
             for ($i = 0; $i < REQUIRED_SNAPSHOT_COUNT; $i++) {
