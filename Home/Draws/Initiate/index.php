@@ -40,7 +40,7 @@ $parse_db_photos = function ($raw_val) {
         return $out;
     }
     $trim_val = trim((string)$raw_val);
-   if (strpos($trim_val, '[') === 0) {
+    if (strpos($trim_val, '[') === 0) {
         $arr = json_decode($trim_val, true);
         if (is_array($arr)) {
             for ($i = 0; $i < REQUIRED_SNAPSHOT_COUNT; $i++) {
@@ -191,6 +191,144 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'upload_snapshot')
             'path'   => $rel_path,
             'url'    => BASE_URL . ltrim($rel_path, '/'),
             'photos' => array_values($current_paths),
+        ]);
+    } catch (Exception $e) {
+        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+    }
+    exit;
+}
+
+// 0c. AJAX Cross-Device Draft Autosave Endpoint
+if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'autosave_draft') {
+    ini_set('display_errors', 0);
+    error_reporting(0);
+    header('Content-Type: application/json');
+
+    try {
+        $draw_id_str   = trim((string)($_POST['draw_id'] ?? ''));
+        $draw_hash_str = trim((string)($_POST['draw_hash_code'] ?? ''));
+
+        if ($draw_id_str === '' && $draw_hash_str === '') {
+            echo json_encode(['status' => 'skipped', 'message' => 'No draw hash or ID yet.']);
+            exit;
+        }
+
+        $match_parts = [];
+        $match_params = [];
+        if ($draw_hash_str !== '') {
+            $match_parts[] = "draw_hash_code = :m_hash";
+            $match_params[':m_hash'] = $draw_hash_str;
+        }
+        if ($draw_id_str !== '' && ctype_digit($draw_id_str)) {
+            $match_parts[] = "id = :m_id";
+            $match_params[':m_id'] = (int)$draw_id_str;
+        }
+
+        $sel = $pdo->prepare("SELECT id, draw_date, start_time, end_time FROM draws WHERE " . implode(" OR ", $match_parts) . " LIMIT 1");
+        $sel->execute($match_params);
+        $existing = $sel->fetch(PDO::FETCH_ASSOC);
+
+        if (!$existing) {
+            echo json_encode(['status' => 'error', 'message' => 'Draw record not found.']);
+            exit;
+        }
+
+        $draw_date = !empty($existing['draw_date']) ? (string)$existing['draw_date'] : date('Y-m-d');
+        $is_backdated = ($draw_date < date('Y-m-d'));
+
+        $raw_s = $is_backdated ? ($_POST['start_time_manual'] ?? '') : ($_POST['start_time'] ?? '');
+        $raw_e = $is_backdated ? ($_POST['end_time_manual'] ?? '') : ($_POST['end_time'] ?? '');
+
+        $norm_s = $normalize_24h_time($raw_s);
+        $norm_e = $normalize_24h_time($raw_e);
+
+        $start_dt = ($norm_s !== '') ? ($draw_date . ' ' . $norm_s) : (string)$existing['start_time'];
+        $end_dt   = ($norm_e !== '') ? ($draw_date . ' ' . $norm_e) : (string)$existing['end_time'];
+
+        $n_a = [];
+        $n_b = [];
+        for ($k = 1; $k <= 5; $k++) {
+            $va = $_POST['n' . $k . '_a'] ?? '';
+            $vb = $_POST['n' . $k . '_b'] ?? '';
+            $n_a[$k] = ($va !== '' && is_numeric($va)) ? max(0, min(90, (int)$va)) : 0;
+            $n_b[$k] = ($vb !== '' && is_numeric($vb)) ? max(0, min(90, (int)$vb)) : 0;
+        }
+
+        $exc_status = $_POST['exception_status'] ?? 'NONE';
+        if (!in_array($exc_status, ['NONE', 'MINOR_RESOLVED', 'SIGNIFICANT_EXCEPTION'], true)) {
+            $exc_status = 'NONE';
+        }
+        $exc_ref  = trim((string)($_POST['exception_report_ref'] ?? ''));
+        $exc_desc = trim((string)($_POST['exception_details'] ?? ''));
+
+        if ($exc_status === 'NONE') {
+            $exc_ref = null;
+            $exc_desc = null;
+        } elseif ($exc_status === 'MINOR_RESOLVED') {
+            $exc_ref = null;
+        }
+
+        $params = [
+            ':draw_session'         => trim((string)($_POST['draw_session'] ?? '')),
+            ':start_time'           => $start_dt,
+            ':end_time'             => $end_dt,
+            ':venue_location'       => trim((string)($_POST['venue'] ?? '')),
+            ':gps_latitude'         => ($_POST['lat'] !== '' && is_numeric($_POST['lat'])) ? (float)$_POST['lat'] : 0.0,
+            ':gps_longitude'        => ($_POST['lng'] !== '' && is_numeric($_POST['lng'])) ? (float)$_POST['lng'] : 0.0,
+            ':chk_pre_draw'         => (!empty($_POST['chk_pre']) && $_POST['chk_pre'] !== '0') ? 1 : 0,
+            ':chk_draw_obs'         => (!empty($_POST['chk_obs']) && $_POST['chk_obs'] !== '0') ? 1 : 0,
+            ':chk_post_draw'        => (!empty($_POST['chk_post']) && $_POST['chk_post'] !== '0') ? 1 : 0,
+            ':procedure_notes'      => (string)($_POST['procedure_notes'] ?? ''),
+            ':exception_status'     => $exc_status,
+            ':exception_report_ref' => $exc_ref,
+            ':exception_details'    => $exc_desc,
+            ':num1_a'               => $n_a[1],
+            ':num2_a'               => $n_a[2],
+            ':num3_a'               => $n_a[3],
+            ':num4_a'               => $n_a[4],
+            ':num5_a'               => $n_a[5],
+            ':num1_b'               => $n_b[1],
+            ':num2_b'               => $n_b[2],
+            ':num3_b'               => $n_b[3],
+            ':num4_b'               => $n_b[4],
+            ':num5_b'               => $n_b[5],
+        ];
+
+        $sql_where = [];
+        $exec_params = $params;
+        if ($draw_hash_str !== '') {
+            $sql_where[] = "draw_hash_code = :w_hash";
+            $exec_params[':w_hash'] = $draw_hash_str;
+        }
+        if ($draw_id_str !== '' && ctype_digit($draw_id_str)) {
+            $sql_where[] = "id = :w_id";
+            $exec_params[':w_id'] = (int)$draw_id_str;
+        }
+
+        $sql = "UPDATE draws SET
+            draw_session = :draw_session,
+            start_time = :start_time,
+            end_time = :end_time,
+            venue_location = :venue_location,
+            gps_latitude = :gps_latitude,
+            gps_longitude = :gps_longitude,
+            chk_pre_draw = :chk_pre_draw,
+            chk_draw_obs = :chk_draw_obs,
+            chk_post_draw = :chk_post_draw,
+            procedure_notes = :procedure_notes,
+            exception_status = :exception_status,
+            exception_report_ref = :exception_report_ref,
+            exception_details = :exception_details,
+            num1_a = :num1_a, num2_a = :num2_a, num3_a = :num3_a, num4_a = :num4_a, num5_a = :num5_a,
+            num1_b = :num1_b, num2_b = :num2_b, num3_b = :num3_b, num4_b = :num4_b, num5_b = :num5_b
+            WHERE " . implode(" OR ", $sql_where);
+
+        $upd = $pdo->prepare($sql);
+        $upd->execute($exec_params);
+
+        echo json_encode([
+            'status'   => 'success',
+            'saved_at' => date('H:i:s'),
         ]);
     } catch (Exception $e) {
         echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
@@ -705,7 +843,7 @@ $curr_exc_desc   = (string)($_POST['exception_details'] ?? ($resume_draw['except
 $default_conclusion = "Based on the procedures performed and the evidence obtained, the scheduled draw was observed and the results verified against the agreed records. No significant exception was identified in the procedures covered by this verification.";
 $val_notes = (string)($_POST['procedure_notes'] ?? ($resume_draw['procedure_notes'] ?? $default_conclusion));
 
-// Check if all 5 numbers in DB are 0 (fresh pre-created draft) so we don't overwrite user's localStorage with 0s
+// Check if all 5 numbers in DB are non-zero (resumed draw with saved numbers)
 $db_has_nonzero_numbers = false;
 if ($resume_draw) {
     for ($k = 1; $k <= 5; $k++) {
@@ -831,11 +969,13 @@ $slot_labels = [
     const IS_BACKDATED = <?= $is_backdated_draw ? 'true' : 'false' ?>;
     const IS_DATE_LOCKED = <?= $is_date_locked ? 'true' : 'false' ?>;
     const REQUIRED_SNAPSHOTS = <?= REQUIRED_SNAPSHOT_COUNT ?>;
+    const DB_HAS_NONZERO_NUMBERS = <?= $db_has_nonzero_numbers ? 'true' : 'false' ?>;
     const DRAW_KEY_SUFFIX = <?= json_encode($val_draw_hash) ?> || 'default';
     const STORAGE_KEY = 'ldc_draw_form_' + DRAW_KEY_SUFFIX;
     const GPS_LOCK_KEY = 'ldc_gps_locked_' + DRAW_KEY_SUFFIX;
 
     let gpsTrackedOnce = false;
+    let dbAutosaveTimer = null;
 
     function lockDrawDateInput() {
         const dateInput = document.getElementById('draw_date');
@@ -929,7 +1069,7 @@ $slot_labels = [
             ' — <strong>' + distText + '</strong> from RBA Studio.';
 
         lockGpsUI(userLat, userLng, msg);
-        saveFormBackup();
+        scheduleServerAutosave(300);
     }
 
     function captureLocation(highAccuracy = true, forceUnlock = false) {
@@ -1107,7 +1247,7 @@ $slot_labels = [
                 submitBtn.disabled = false;
                 submitBtn.style.opacity = '1';
             }
-            saveFormBackup();
+            scheduleServerAutosave(0);
         }
     }
 
@@ -1118,7 +1258,7 @@ $slot_labels = [
             if (val > 90) input.value = 90;
         }
         updateBallPreview(prefix);
-        saveFormBackup();
+        scheduleServerAutosave(700);
     }
 
     function updateBallPreview(prefix) {
@@ -1286,6 +1426,90 @@ $slot_labels = [
         localStorage.setItem(STORAGE_KEY, JSON.stringify(formObj));
     }
 
+    function syncDraftToServer() {
+        const drawId = (document.getElementById('draw_id')?.value || '').trim();
+        const drawHash = (document.getElementById('draw_hash_code')?.value || '').trim();
+        const noticeEl = document.getElementById('session-saved-notice');
+
+        if (!drawId && !drawHash) return;
+
+        const fd = new FormData();
+        fd.append('ajax_action', 'autosave_draft');
+        fd.append('draw_id', drawId);
+        fd.append('draw_hash_code', drawHash);
+        fd.append('draw_date', document.getElementById('draw_date')?.value || '');
+        fd.append('draw_session', document.querySelector('input[name="draw_session"]')?.value || '');
+        fd.append('start_time', document.getElementById('start_time')?.value || '');
+        fd.append('end_time', document.getElementById('end_time')?.value || '');
+        fd.append('start_time_manual', document.getElementById('start_time_manual')?.value || '');
+        fd.append('end_time_manual', document.getElementById('end_time_manual')?.value || '');
+        fd.append('venue', document.querySelector('input[name="venue"]')?.value || '');
+        fd.append('lat', document.getElementById('lat')?.value || '');
+        fd.append('lng', document.getElementById('lng')?.value || '');
+        fd.append('chk_pre', document.querySelector('input[name="chk_pre"]')?.checked ? '1' : '0');
+        fd.append('chk_obs', document.querySelector('input[name="chk_obs"]')?.checked ? '1' : '0');
+        fd.append('chk_post', document.querySelector('input[name="chk_post"]')?.checked ? '1' : '0');
+        fd.append('exception_status', document.querySelector('input[name="exception_status"]:checked')?.value || 'NONE');
+        fd.append('exception_report_ref', document.getElementById('exception_report_ref')?.value || '');
+        fd.append('exception_details', document.getElementById('exception_details')?.value || '');
+        fd.append('procedure_notes', document.querySelector('textarea[name="procedure_notes"]')?.value || '');
+
+        for (let i = 1; i <= 5; i++) {
+            fd.append('n' + i + '_a', document.getElementById('seta_n' + i)?.value ?? '');
+            fd.append('n' + i + '_b', document.getElementById('setb_n' + i)?.value ?? '');
+        }
+
+        if (noticeEl) {
+            noticeEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Syncing draft...';
+        }
+
+        fetch(window.location.href, {
+            method: 'POST',
+            body: fd,
+            credentials: 'same-origin'
+        })
+        .then(async res => {
+            const txt = await res.text();
+            return JSON.parse(txt);
+        })
+        .then(data => {
+            if (data.status === 'success' && noticeEl) {
+                noticeEl.innerHTML = '<i class="fa-solid fa-cloud-check" style="color: var(--jade);"></i> Draft synced at ' + data.saved_at;
+            }
+        })
+        .catch(() => {
+            if (noticeEl) {
+                noticeEl.innerHTML = '<i class="fa-solid fa-triangle-exclamation" style="color: var(--gold);"></i> Offline/sync pending';
+            }
+        });
+    }
+
+    function scheduleServerAutosave(delayMs = 700) {
+        saveFormBackup();
+        const drawId = (document.getElementById('draw_id')?.value || '').trim();
+        const drawHash = (document.getElementById('draw_hash_code')?.value || '').trim();
+        if (!drawId && !drawHash) return;
+
+        clearTimeout(dbAutosaveTimer);
+        if (delayMs <= 0) {
+            syncDraftToServer();
+        } else {
+            dbAutosaveTimer = setTimeout(syncDraftToServer, delayMs);
+        }
+    }
+
+    window.addEventListener('pagehide', function() {
+        clearTimeout(dbAutosaveTimer);
+        syncDraftToServer();
+    });
+
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+            clearTimeout(dbAutosaveTimer);
+            syncDraftToServer();
+        }
+    });
+
     window.addEventListener('DOMContentLoaded', function() {
         applyTimingMode();
 
@@ -1304,7 +1528,7 @@ $slot_labels = [
                 const venueEl = document.querySelector('input[name="venue"]');
                 const notesEl = document.querySelector('textarea[name="procedure_notes"]');
 
-                if (sessionEl && data.draw_session && !<?= isset($_POST['draw_session']) ? 'true' : 'false' ?>) {
+                if (sessionEl && !sessionEl.value && data.draw_session && !<?= isset($_POST['draw_session']) ? 'true' : 'false' ?>) {
                     sessionEl.value = data.draw_session;
                 }
                 if (startTimeEl && !startTimeEl.value && data.start_time) startTimeEl.value = data.start_time;
@@ -1315,24 +1539,27 @@ $slot_labels = [
                 if (sMan && !sMan.value && data.start_time_manual) sMan.value = data.start_time_manual;
                 if (eMan && !eMan.value && data.end_time_manual) eMan.value = data.end_time_manual;
 
-                if (venueEl && data.venue && !<?= isset($_POST['venue']) ? 'true' : 'false' ?>) venueEl.value = data.venue;
-                if (notesEl && data.procedure_notes && !<?= isset($_POST['procedure_notes']) ? 'true' : 'false' ?>) notesEl.value = data.procedure_notes;
+                if (venueEl && !venueEl.value && data.venue && !<?= isset($_POST['venue']) ? 'true' : 'false' ?>) venueEl.value = data.venue;
+                if (notesEl && !notesEl.value && data.procedure_notes && !<?= isset($_POST['procedure_notes']) ? 'true' : 'false' ?>) notesEl.value = data.procedure_notes;
 
                 if (typeof data.chk_pre === 'boolean' && !<?= isset($_POST['chk_pre']) ? 'true' : 'false' ?>) {
-                    document.querySelector('input[name="chk_pre"]').checked = data.chk_pre;
+                    const el = document.querySelector('input[name="chk_pre"]');
+                    if (el && !el.checked) el.checked = data.chk_pre;
                 }
                 if (typeof data.chk_obs === 'boolean' && !<?= isset($_POST['chk_obs']) ? 'true' : 'false' ?>) {
-                    document.querySelector('input[name="chk_obs"]').checked = data.chk_obs;
+                    const el = document.querySelector('input[name="chk_obs"]');
+                    if (el && !el.checked) el.checked = data.chk_obs;
                 }
                 if (typeof data.chk_post === 'boolean' && !<?= isset($_POST['chk_post']) ? 'true' : 'false' ?>) {
-                    document.querySelector('input[name="chk_post"]').checked = data.chk_post;
+                    const el = document.querySelector('input[name="chk_post"]');
+                    if (el && !el.checked) el.checked = data.chk_post;
                 }
 
-                // Restore Set A & Set B numbers whenever localStorage has them
+                // Restore Set A & Set B numbers when empty or when DB has no non-zero numbers yet
                 if (Array.isArray(data.seta)) {
                     data.seta.forEach((val, idx) => {
                         const inp = document.getElementById('seta_n' + (idx + 1));
-                        if (inp && val !== '' && val !== undefined && val !== null) {
+                        if (inp && val !== '' && val !== undefined && val !== null && (inp.value === '' || !DB_HAS_NONZERO_NUMBERS)) {
                             inp.value = String(val);
                         }
                     });
@@ -1340,7 +1567,7 @@ $slot_labels = [
                 if (Array.isArray(data.setb)) {
                     data.setb.forEach((val, idx) => {
                         const inp = document.getElementById('setb_n' + (idx + 1));
-                        if (inp && val !== '' && val !== undefined && val !== null) {
+                        if (inp && val !== '' && val !== undefined && val !== null && (inp.value === '' || !DB_HAS_NONZERO_NUMBERS)) {
                             inp.value = String(val);
                         }
                     });
@@ -1406,11 +1633,11 @@ $slot_labels = [
             if (el.type === 'file') return;
             el.addEventListener('input', () => {
                 validateManualClockOrder();
-                saveFormBackup();
+                scheduleServerAutosave(700);
             });
             el.addEventListener('change', () => {
                 validateManualClockOrder();
-                saveFormBackup();
+                scheduleServerAutosave(700);
             });
         });
     });
@@ -1711,7 +1938,7 @@ $slot_labels = [
 
             <div style="margin-bottom: 20px;">
                 <label style="font-size: 0.85rem; font-weight: 600;">Verification Conclusion</label>
-                <textarea name="procedure_notes" rows="2" placeholder="Verification Conclusion" style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;"><?= htmlspecialchars($val_notes) ?>Based on the procedures performed and the evidence obtained, the scheduled draw was observed and the results verified against the agreed records. No significant exception was identified in the procedures covered by this verification.</textarea>
+                <textarea name="procedure_notes" rows="2" placeholder="Verification Conclusion" style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;"><?= htmlspecialchars($val_notes) ?></textarea>
             </div>
 
             <!-- MFA Step 1 vs Step 2 Submission Controls -->
