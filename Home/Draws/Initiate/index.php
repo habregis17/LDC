@@ -1,4 +1,9 @@
 <?php
+//error_reporting(E_ALL);
+ini_set('display_errors', '1');
+ini_set('display_startup_errors', '1');
+error_reporting(E_ALL);
+
 require_once __DIR__ . '/../../../assets/config/config.php';
 require_once __DIR__ . '/../../../assets/config/mailer.php';
 check_auth(['PRIMARY_VERIFIER', 'ADMIN']);
