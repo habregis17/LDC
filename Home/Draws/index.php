@@ -396,7 +396,7 @@ include_once __DIR__ . '/../../assets/includes/sidebar.php';
             <p style="font-size: 0.85rem; color: var(--pale-charcoal); margin: 4px 0 0;">Search, filter, inspect full audit details, open official certificates, or re-dispatch notifications to stakeholders.</p>
         </div>
         <?php if (in_array($_SESSION['role_code'] ?? '', ['PRIMARY_VERIFIER', 'ADMIN'], true)): ?>
-            <a href="<?= BASE_URL ?>Home/Draws/Initiate/" style="background: var(--red); color: #ffffff; padding: 10px 16px; border-radius: 4px; text-decoration: none; font-weight: 700; font-size: 0.85rem;">
+            <a href="javascript:void(0);" onclick="openAddDrawModal();" style="background: var(--red); color: #ffffff; padding: 10px 16px; border-radius: 4px; text-decoration: none; font-weight: 700; font-size: 0.85rem;">
                 <i class="fa-solid fa-plus"></i> New Draw Session
             </a>
         <?php endif; ?>
@@ -475,8 +475,30 @@ include_once __DIR__ . '/../../assets/includes/sidebar.php';
         </div>
     </form>
 
-    <!-- Indexed Draws Table -->
+<!-- Indexed Draws Table -->
     <div style="background: #ffffff; border: 1px solid var(--pale-charcoal); border-radius: 4px 4px 0 0; overflow-x: auto;">
+        <?php
+        $role_code = strtoupper((string)($_SESSION['role_code'] ?? ($_SESSION['user_role'] ?? '')));
+
+        $visible_draws = array_values(array_filter($draws ?? [], function ($draw) use ($role_code) {
+            $status = strtoupper((string)($draw['status'] ?? ''));
+            $has_partner_sig = !empty($draw['partner_signed_at'])
+                || !empty($draw['partner_signature'])
+                || !empty($draw['signed_at'])
+                || !empty($draw['partner_name']);
+
+            if ($role_code === 'PARTNER') {
+                return $status === 'PENDING_PARTNER_APPROVAL';
+            }
+
+            if ($role_code === 'STAKEHOLDER') {
+                return ($status === 'CERTIFIED') || $has_partner_sig;
+            }
+
+            return true;
+        }));
+        ?>
+
         <table class="custom-table" style="margin: 0; width: 100%;">
             <thead>
                 <tr>
@@ -490,16 +512,22 @@ include_once __DIR__ . '/../../assets/includes/sidebar.php';
                 </tr>
             </thead>
             <tbody>
-                <?php if (empty($draws)): ?>
+                <?php if (empty($visible_draws)): ?>
                     <tr>
                         <td colspan="7" style="text-align: center; padding: 28px; color: var(--slate);">
                             <i class="fa-solid fa-folder-open fa-lg" style="margin-bottom: 6px; display: block;"></i>
-                            No draw records match your current search or filter criteria.
+                            <?php if ($role_code === 'PARTNER'): ?>
+                                No draw records pending partner review match your current search or filter criteria.
+                            <?php elseif ($role_code === 'STAKEHOLDER'): ?>
+                                No signed draw records match your current search or filter criteria.
+                            <?php else: ?>
+                                No draw records match your current search or filter criteria.
+                            <?php endif; ?>
                         </td>
                     </tr>
                 <?php else: ?>
-                    <?php foreach ($draws as $idx => $d): ?>
-                        <?php $row_num = $offset + $idx + 1; ?>
+                    <?php foreach ($visible_draws as $vis_idx => $d): ?>
+                        <?php $row_num = ($offset ?? 0) + $vis_idx + 1; ?>
                         <tr>
                             <td style="color: var(--slate); font-weight: 700; font-size: 0.82rem;"><?= $row_num ?></td>
                             <td>
@@ -510,7 +538,7 @@ include_once __DIR__ . '/../../assets/includes/sidebar.php';
                                     <?= htmlspecialchars($d['draw_session']) ?>
                                 </div>
                                 <div style="font-size: 0.72rem; color: var(--slate); font-family: monospace;">
-                                    Hash: <?= htmlspecialchars(substr($d['draw_hash_code'], 0, 12)) ?>...
+                                    Hash: <?= htmlspecialchars(substr((string)$d['draw_hash_code'], 0, 12)) ?>...
                                 </div>
                             </td>
                             <td style="font-size: 0.83rem;">
@@ -554,35 +582,33 @@ include_once __DIR__ . '/../../assets/includes/sidebar.php';
                             <td style="text-align: right;">
                                 <div style="display: inline-flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap;">
                                     <?php
-                                    // Use whichever row variable is in scope in your loop (e.g. $row, $d, or $draw)
-                                    $current_draw = $draw ?? ($row ?? ($d ?? []));
-                                    $cert_hash    = trim((string)($current_draw['draw_hash_code'] ?? ''));
-                                    $is_certified = (($current_draw['status'] ?? '') === 'CERTIFIED');
+                                    $cert_hash    = trim((string)($d['draw_hash_code'] ?? ''));
+                                    $is_certified = (($d['status'] ?? '') === 'CERTIFIED');
                                     ?>
 
                                     <?php if ($is_certified && $cert_hash !== ''): ?>
-                                        <a href="<?= BASE_URL ?>Home/Draws/Certificate/pdf.php?id=<?= urlencode($cert_hash) ?>&mode=inline" target="_blank" class="action-btn-sm" style="background: var(--burgundy); color: #ffffff;" >
+                                        <a href="<?= BASE_URL ?>Home/Draws/Certificate/pdf.php?id=<?= urlencode($cert_hash) ?>&mode=inline" target="_blank" class="action-btn-sm" style="background: var(--burgundy); color: #ffffff;">
                                             <i class="fa-solid fa-file-pdf"></i> View PDF
                                         </a>
-                                        <a href="<?= BASE_URL ?>Home/Draws/Certificate/pdf.php?id=<?= urlencode($cert_hash) ?>&mode=download" class="action-btn-sm" style="background: var(--gold); color: #ffffff;" >
+                                        <a href="<?= BASE_URL ?>Home/Draws/Certificate/pdf.php?id=<?= urlencode($cert_hash) ?>&mode=download" class="action-btn-sm" style="background: var(--gold); color: #ffffff;">
                                             <i class="fa-solid fa-download"></i> Download PDF
                                         </a>
                                     <?php endif; ?>
 
                                     <?php if ($d['status'] !== 'IN_PROGRESS'): ?>
-                                        <a href="<?= BASE_URL ?>Home/Draws/Review/?id=<?= $d['draw_hash_code'] ?>" class="action-btn-sm" style="background: var(--ocean); color: #ffffff;" title="Inspect Full Details & Audit Trail">
+                                        <a href="<?= BASE_URL ?>Home/Draws/Review/?id=<?= urlencode((string)$d['draw_hash_code']) ?>" class="action-btn-sm" style="background: var(--ocean); color: #ffffff;" title="Inspect Full Details & Audit Trail">
                                             <i class="fa-solid fa-eye"></i> Details
                                         </a>
 
                                         <button type="button"
                                                 class="action-btn-sm"
                                                 style="background: var(--charcoal); color: #ffffff;"
-                                                onclick="openResendModal(<?= (int)$d['id'] ?>, '<?= htmlspecialchars($d['certificate_ref'], ENT_QUOTES) ?>', '<?= htmlspecialchars($d['status'], ENT_QUOTES) ?>')"
+                                                onclick="openResendModal(<?= (int)$d['id'] ?>, '<?= htmlspecialchars((string)$d['certificate_ref'], ENT_QUOTES) ?>', '<?= htmlspecialchars((string)$d['status'], ENT_QUOTES) ?>')"
                                                 title="Resend Notification or Certificate via Email">
                                             <i class="fa-solid fa-paper-plane"></i> Resend
                                         </button>
                                     <?php else: ?>
-                                        <a href="<?= BASE_URL ?>Home/Draws/Initiate/" class="action-btn-sm" style="background: var(--gold); color: #ffffff;">
+                                        <a href="<?= BASE_URL ?>Home/Draws/Initiate/?hash=<?= urlencode((string)$d['draw_hash_code']) ?>" class="action-btn-sm" style="background: var(--gold); color: #ffffff;">
                                             <i class="fa-solid fa-play"></i> Resume
                                         </a>
                                     <?php endif; ?>
@@ -630,6 +656,124 @@ include_once __DIR__ . '/../../assets/includes/sidebar.php';
         </div>
     </div>
 </main>
+    <!-- Add Draw Session Date Modal -->
+<div id="add-draw-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9999; align-items:center; justify-content:center; padding:16px;">
+    <div style="background:#fff; width:100%; max-width:430px; border-radius:6px; border-top:5px solid var(--red); padding:22px; box-shadow:0 12px 30px rgba(0,0,0,0.25);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+            <h3 style="margin:0; color:var(--charcoal); font-size:1.05rem;">
+                <i class="fa-solid fa-calendar-plus"></i> Select Draw Date
+            </h3>
+            <button type="button" onclick="closeAddDrawModal()" style="background:none; border:none; font-size:1.2rem; cursor:pointer; color:var(--slate);">&times;</button>
+        </div>
+
+        <p style="font-size:0.82rem; color:var(--slate); margin:0 0 14px;">
+            Choose the draw date first. We will create the draw record, generate its hashcode, and open the verification page with the date locked.
+        </p>
+
+        <div style="margin-bottom:14px;">
+            <label for="modal_draw_date" style="display:block; font-size:0.85rem; font-weight:700; color:var(--charcoal); margin-bottom:5px;">
+                Draw Date
+            </label>
+            <input type="date" id="modal_draw_date" value="<?= date('Y-m-d') ?>" required
+                   style="width:100%; padding:9px; border:1px solid var(--pale-charcoal); border-radius:4px; font-size:0.9rem;">
+        </div>
+
+        <div style="margin-bottom:18px;">
+            <label for="modal_draw_session" style="display:block; font-size:0.85rem; font-weight:700; color:var(--charcoal); margin-bottom:5px;">
+                Draw Session Name <span style="font-weight:400; color:var(--slate);">(optional now)</span>
+            </label>
+            <input type="text" id="modal_draw_session" placeholder="e.g. Intego 5/90 Evening Main Draw"
+                   style="width:100%; padding:9px; border:1px solid var(--pale-charcoal); border-radius:4px; font-size:0.9rem;">
+        </div>
+
+        <div id="modal-draw-error" style="display:none; background:#fdecea; color:#842029; border:1px solid #f5c2c7; padding:8px 10px; border-radius:4px; font-size:0.8rem; margin-bottom:14px;"></div>
+
+        <div style="display:flex; justify-content:flex-end; gap:10px;">
+            <button type="button" onclick="closeAddDrawModal()" style="background:var(--pale-charcoal); color:var(--charcoal); border:none; padding:9px 14px; border-radius:4px; font-weight:600; cursor:pointer;">
+                Cancel
+            </button>
+            <button type="button" id="modal-create-draw-btn" onclick="submitPrecreateDraw()" style="background:var(--red); color:#fff; border:none; padding:9px 16px; border-radius:4px; font-weight:700; cursor:pointer;">
+                <i class="fa-solid fa-arrow-right"></i> Create &amp; Open Initiate
+            </button>
+        </div>
+    </div>
+</div>
+
+<script>
+function openAddDrawModal() {
+    const modal = document.getElementById('add-draw-modal');
+    const errBox = document.getElementById('modal-draw-error');
+    if (errBox) {
+        errBox.style.display = 'none';
+        errBox.textContent = '';
+    }
+    if (modal) modal.style.display = 'flex';
+}
+
+function closeAddDrawModal() {
+    const modal = document.getElementById('add-draw-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+function submitPrecreateDraw() {
+    const dateEl = document.getElementById('modal_draw_date');
+    const sessEl = document.getElementById('modal_draw_session');
+    const btn = document.getElementById('modal-create-draw-btn');
+    const errBox = document.getElementById('modal-draw-error');
+
+    const chosenDate = dateEl ? dateEl.value.trim() : '';
+    const sessionName = sessEl ? sessEl.value.trim() : '';
+
+    if (!chosenDate) {
+        if (errBox) {
+            errBox.textContent = 'Please select a draw date.';
+            errBox.style.display = 'block';
+        }
+        return;
+    }
+
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Creating...';
+    }
+
+    const fd = new FormData();
+    fd.append('ajax_action', 'precreate_draw');
+    fd.append('draw_date', chosenDate);
+    fd.append('draw_session', sessionName);
+
+    fetch('<?= BASE_URL ?>Home/Draws/Initiate/', {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin'
+    })
+    .then(async res => {
+        const txt = await res.text();
+        try {
+            return JSON.parse(txt);
+        } catch (e) {
+            throw new Error(txt.substring(0, 160) || 'Invalid server response');
+        }
+    })
+    .then(data => {
+        if (data.status === 'success' && data.draw_hash_code) {
+            window.location.href = '<?= BASE_URL ?>Home/Draws/Initiate/?hash=' + encodeURIComponent(data.draw_hash_code);
+        } else {
+            throw new Error(data.message || 'Could not pre-create draw.');
+        }
+    })
+    .catch(err => {
+        if (errBox) {
+            errBox.textContent = err.message;
+            errBox.style.display = 'block';
+        }
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fa-solid fa-arrow-right"></i> Create &amp; Open Initiate';
+        }
+    });
+}
+</script>
 
 <!-- Stakeholder Resend Modal -->
 <div id="resend-modal" class="resend-modal-backdrop" onclick="if(event.target === this) closeResendModal();">
@@ -687,3 +831,4 @@ include_once __DIR__ . '/../../assets/includes/sidebar.php';
 </script>
 
 <?php include_once __DIR__ . '/../../assets/includes/footer.php'; ?>
+ 

@@ -5,10 +5,28 @@ check_auth(['PRIMARY_VERIFIER', 'ADMIN']);
 
 $error = '';
 $success = '';
-$mfa_step = (int)($_SESSION['initiate_mfa_step'] ?? 1);
 $today_date = date('Y-m-d');
 
+// Only stay on MFA step 2 during an active POST confirmation/retry; never show MFA automatically on fresh GET
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    unset($_SESSION['initiate_mfa_step']);
+}
+$mfa_step = (int)($_SESSION['initiate_mfa_step'] ?? 1);
+
 const REQUIRED_SNAPSHOT_COUNT = 3;
+
+// Normalize time input (HH:MM or HH:MM:SS) to HH:MM:SS or '' if invalid/empty
+$normalize_24h_time = function (?string $raw): string {
+    $t = trim((string)$raw);
+    if ($t === '') {
+        return '';
+    }
+    if (preg_match('/^([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/', $t, $m)) {
+        $sec = isset($m[3]) ? $m[3] : '00';
+        return sprintf('%02d:%02d:%02d', (int)$m[1], (int)$m[2], (int)$sec);
+    }
+    return '';
+};
 
 // Helper to normalize stored DB photo column (supports legacy single string or JSON array)
 $parse_db_photos = function ($raw_val) {
@@ -30,18 +48,171 @@ $parse_db_photos = function ($raw_val) {
     return $out;
 };
 
-// Optional resume support if ?hash=... or ?resume=... or ?id=... is passed
-$resume_key = trim((string)($_GET['hash'] ?? ($_GET['resume'] ?? ($_GET['draft_id'] ?? ($_GET['id'] ?? '')))));
-$resume_draw = null;
-if ($resume_key !== '') {
-    if (ctype_digit($resume_key)) {
-        $r_stmt = $pdo->prepare("SELECT * FROM draws WHERE id = ? OR draw_hash_code = ? LIMIT 1");
-        $r_stmt->execute([(int)$resume_key, $resume_key]);
-    } else {
-        $r_stmt = $pdo->prepare("SELECT * FROM draws WHERE draw_hash_code = ? OR certificate_ref = ? LIMIT 1");
-        $r_stmt->execute([$resume_key, $resume_key]);
+// 0. AJAX Pre-Creation Endpoint (Creates draw & hashcode immediately on modal confirm)
+if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'precreate_draw') {
+    ini_set('display_errors', 0);
+    error_reporting(0);
+    header('Content-Type: application/json');
+
+    try {
+        $draw_date    = trim((string)($_POST['draw_date'] ?? ''));
+        $draw_session = trim((string)($_POST['draw_session'] ?? ''));
+
+        if ($draw_date === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $draw_date)) {
+            echo json_encode(['status' => 'error', 'message' => 'A valid draw date is required.']);
+            exit;
+        }
+        if ($draw_date > date('Y-m-d')) {
+            echo json_encode(['status' => 'error', 'message' => 'Future dates are not allowed.']);
+            exit;
+        }
+
+        $ref  = generate_reference($pdo, $draw_date);
+        $hash = md5(uniqid($ref . '_' . $draw_date, true));
+
+        $stmt = $pdo->prepare("INSERT INTO draws
+            (draw_hash_code, certificate_ref, draw_date, draw_session, start_time, end_time,
+             venue_location, gps_latitude, gps_longitude, primary_verifier_id,
+             chk_pre_draw, chk_draw_obs, chk_post_draw, procedure_notes,
+             exception_status, exception_report_ref, exception_details,
+             num1_a, num2_a, num3_a, num4_a, num5_a,
+             num1_b, num2_b, num3_b, num4_b, num5_b,
+             central_system_photo, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, '', 'NONE', '', '', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '[]', 'IN_PROGRESS')");
+
+        $ok = $stmt->execute([
+            $hash,
+            $ref,
+            $draw_date,
+            $draw_session,
+            $draw_date . ' 00:00:00',
+            $draw_date . ' 00:00:00',
+            'Rwanda Broadcasting Agency (RBA) Studio, Kacyiru',
+            0.0,
+            0.0,
+            $_SESSION['user_id']
+        ]);
+
+        if ($ok) {
+            $new_id = (string)$pdo->lastInsertId();
+            echo json_encode([
+                'status'          => 'success',
+                'draw_id'         => ($new_id !== '' && $new_id !== '0') ? $new_id : $hash,
+                'draw_hash_code'  => $hash,
+                'certificate_ref' => $ref,
+                'draw_date'       => $draw_date,
+            ]);
+        } else {
+            echo json_encode(['status' => 'error', 'message' => 'Failed to pre-create draw record.']);
+        }
+    } catch (Exception $e) {
+        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
     }
+    exit;
+}
+
+// 0b. AJAX Instant Snapshot Upload Endpoint (Persists each photo immediately across refreshes)
+if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'upload_snapshot') {
+    ini_set('display_errors', 0);
+    error_reporting(0);
+    header('Content-Type: application/json');
+
+    try {
+        $slot_idx      = (int)($_POST['slot_index'] ?? -1);
+        $draw_id_str   = trim((string)($_POST['draw_id'] ?? ''));
+        $draw_hash_str = trim((string)($_POST['draw_hash_code'] ?? ''));
+
+        if ($slot_idx < 0 || $slot_idx >= REQUIRED_SNAPSHOT_COUNT) {
+            echo json_encode(['status' => 'error', 'message' => 'Invalid snapshot slot.']);
+            exit;
+        }
+        if ($draw_id_str === '' && $draw_hash_str === '') {
+            echo json_encode(['status' => 'error', 'message' => 'Missing draw reference. Open or start a draw session first.']);
+            exit;
+        }
+        if (!isset($_FILES['snapshot_file']) || ($_FILES['snapshot_file']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+            echo json_encode(['status' => 'error', 'message' => 'No valid image uploaded.']);
+            exit;
+        }
+
+        $allowed_ext = ['jpg', 'jpeg', 'png', 'webp', 'gif'];
+        $orig_name = $_FILES['snapshot_file']['name'] ?? '';
+        $tmp_name  = $_FILES['snapshot_file']['tmp_name'] ?? '';
+        $ext = strtolower(pathinfo($orig_name, PATHINFO_EXTENSION));
+
+        if (!in_array($ext, $allowed_ext, true) || !is_uploaded_file($tmp_name)) {
+            echo json_encode(['status' => 'error', 'message' => 'Unsupported image format.']);
+            exit;
+        }
+
+        $match_parts = [];
+        $match_params = [];
+        if ($draw_hash_str !== '') {
+            $match_parts[] = "draw_hash_code = :m_hash";
+            $match_params[':m_hash'] = $draw_hash_str;
+        }
+        if ($draw_id_str !== '' && ctype_digit($draw_id_str)) {
+            $match_parts[] = "id = :m_id";
+            $match_params[':m_id'] = (int)$draw_id_str;
+        }
+
+        $sel = $pdo->prepare("SELECT central_system_photo FROM draws WHERE " . implode(" OR ", $match_parts) . " LIMIT 1");
+        $sel->execute($match_params);
+        $current_paths = $parse_db_photos($sel->fetchColumn());
+
+        $upload_dir = __DIR__ . '/../../../uploads';
+        if (!is_dir($upload_dir)) {
+            mkdir($upload_dir, 0775, true);
+        }
+
+        $filename = md5(time() . '_' . $slot_idx . '_' . random_int(1000, 9999)) . '.' . $ext;
+        $disk_target = $upload_dir . '/' . $filename;
+
+        if (!move_uploaded_file($tmp_name, $disk_target)) {
+            echo json_encode(['status' => 'error', 'message' => 'Failed to save uploaded image to uploads directory.']);
+            exit;
+        }
+
+        $rel_path = 'uploads/' . $filename;
+        $current_paths[$slot_idx] = $rel_path;
+
+        $upd_params = $match_params;
+        $upd_params[':photos'] = json_encode(array_values($current_paths));
+        $upd = $pdo->prepare("UPDATE draws SET central_system_photo = :photos WHERE " . implode(" OR ", $match_parts));
+        $upd->execute($upd_params);
+
+        echo json_encode([
+            'status' => 'success',
+            'path'   => $rel_path,
+            'url'    => BASE_URL . ltrim($rel_path, '/'),
+            'photos' => array_values($current_paths),
+        ]);
+    } catch (Exception $e) {
+        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+    }
+    exit;
+}
+
+// Resolve draw by hashcode (primary) or id/ref fallback
+$resume_key = trim((string)($_GET['hash'] ?? ($_GET['resume'] ?? ($_GET['draft_id'] ?? ($_GET['id'] ?? '')))));
+$post_hash  = trim((string)($_POST['draw_hash_code'] ?? ''));
+$post_id    = trim((string)($_POST['draw_id'] ?? ''));
+
+$lookup_hash = $post_hash !== '' ? $post_hash : $resume_key;
+$resume_draw = null;
+
+if ($lookup_hash !== '') {
+    $r_stmt = $pdo->prepare("SELECT * FROM draws WHERE draw_hash_code = ? OR certificate_ref = ? LIMIT 1");
+    $r_stmt->execute([$lookup_hash, $lookup_hash]);
     $resume_draw = $r_stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+}
+if (!$resume_draw) {
+    $id_candidate = $post_id !== '' ? $post_id : (ctype_digit($resume_key) ? $resume_key : '');
+    if ($id_candidate !== '') {
+        $r_stmt = $pdo->prepare("SELECT * FROM draws WHERE id = ? LIMIT 1");
+        $r_stmt->execute([(int)$id_candidate]);
+        $resume_draw = $r_stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+    }
 }
 
 // Decode previously persisted photo paths
@@ -74,7 +245,7 @@ if (empty($_SESSION['user_email']) || empty($_SESSION['user_name'])) {
     }
 }
 
-// Helper to persist all 3 snapshot slots safely to /uploads/
+// Helper to persist all 3 snapshot slots safely to /uploads/ on form POST
 $persist_all_snapshots = function ($draw_id_val, $draw_hash_val, array $current_saved) use ($pdo, $parse_db_photos) {
     $draw_id_str   = trim((string)$draw_id_val);
     $draw_hash_str = trim((string)$draw_hash_val);
@@ -152,7 +323,7 @@ $count_attached_snapshots = function (array $paths) {
     return $cnt;
 };
 
-// 1. Handle AJAX Draft Creation on Start Session (No date restrictions)
+// 1. Handle AJAX Draft Sync on Start Session (also persists drawn numbers)
 if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'create_draft') {
     ini_set('display_errors', 0);
     error_reporting(0);
@@ -163,29 +334,46 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'create_draft') {
         $existing_draw_hash = trim((string)($_POST['draw_hash_code'] ?? ''));
         $draw_date          = trim((string)($_POST['draw_date'] ?? date('Y-m-d')));
         $draw_session       = trim((string)($_POST['draw_session'] ?? 'Unnamed Session'));
-        $time_only          = trim((string)($_POST['start_time'] ?? date('H:i:s')));
+        $time_only          = $normalize_24h_time($_POST['start_time'] ?? date('H:i:s')) ?: date('H:i:s');
 
         if ($draw_date === '') {
             $draw_date = date('Y-m-d');
         }
         $start_datetime = $draw_date . ' ' . $time_only;
 
-        // If a draft already exists for this session/hash/id, update it instead of creating a duplicate
+        $n_a = [];
+        $n_b = [];
+        for ($k = 1; $k <= 5; $k++) {
+            $va = $_POST['n' . $k . '_a'] ?? '';
+            $vb = $_POST['n' . $k . '_b'] ?? '';
+            $n_a[$k] = ($va !== '' && is_numeric($va)) ? max(0, min(90, (int)$va)) : 0;
+            $n_b[$k] = ($vb !== '' && is_numeric($vb)) ? max(0, min(90, (int)$vb)) : 0;
+        }
+
         $existing_row = null;
         if ($existing_draw_hash !== '') {
-            $chk = $pdo->prepare("SELECT id, certificate_ref, draw_hash_code FROM draws WHERE draw_hash_code = ? LIMIT 1");
+            $chk = $pdo->prepare("SELECT id, certificate_ref, draw_hash_code, draw_date FROM draws WHERE draw_hash_code = ? LIMIT 1");
             $chk->execute([$existing_draw_hash]);
             $existing_row = $chk->fetch(PDO::FETCH_ASSOC);
         } elseif ($existing_draw_id !== '' && ctype_digit($existing_draw_id)) {
-            $chk = $pdo->prepare("SELECT id, certificate_ref, draw_hash_code FROM draws WHERE id = ? LIMIT 1");
+            $chk = $pdo->prepare("SELECT id, certificate_ref, draw_hash_code, draw_date FROM draws WHERE id = ? LIMIT 1");
             $chk->execute([(int)$existing_draw_id]);
             $existing_row = $chk->fetch(PDO::FETCH_ASSOC);
         }
 
         if ($existing_row) {
-            $kept_hash = !empty($existing_row['draw_hash_code']) ? $existing_row['draw_hash_code'] : md5(uniqid((string)$existing_row['id'], true));
-            $pdo->prepare("UPDATE draws SET draw_date = ?, draw_hash_code = ?, draw_session = ?, start_time = ?, status = 'IN_PROGRESS' WHERE id = ?")
-                ->execute([$draw_date, $kept_hash, $draw_session, $start_datetime, $existing_row['id']]);
+            $locked_date = !empty($existing_row['draw_date']) ? (string)$existing_row['draw_date'] : $draw_date;
+            $kept_hash   = !empty($existing_row['draw_hash_code']) ? (string)$existing_row['draw_hash_code'] : md5(uniqid((string)$existing_row['id'], true));
+            $pdo->prepare("UPDATE draws SET draw_date = ?, draw_hash_code = ?, draw_session = ?, start_time = ?,
+                num1_a = ?, num2_a = ?, num3_a = ?, num4_a = ?, num5_a = ?,
+                num1_b = ?, num2_b = ?, num3_b = ?, num4_b = ?, num5_b = ?,
+                status = 'IN_PROGRESS' WHERE id = ?")
+                ->execute([
+                    $locked_date, $kept_hash, $draw_session, $locked_date . ' ' . $time_only,
+                    $n_a[1], $n_a[2], $n_a[3], $n_a[4], $n_a[5],
+                    $n_b[1], $n_b[2], $n_b[3], $n_b[4], $n_b[5],
+                    $existing_row['id']
+                ]);
 
             echo json_encode([
                 'status'         => 'success',
@@ -201,17 +389,15 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'create_draft') {
         $hash = ($existing_draw_hash !== '') ? $existing_draw_hash : md5(uniqid($ref, true));
 
         $stmt = $pdo->prepare("INSERT INTO draws 
-            (draw_hash_code, certificate_ref, draw_date, draw_session, start_time, venue_location, primary_verifier_id, status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'IN_PROGRESS')");
+            (draw_hash_code, certificate_ref, draw_date, draw_session, start_time, end_time, venue_location, primary_verifier_id,
+             num1_a, num2_a, num3_a, num4_a, num5_a, num1_b, num2_b, num3_b, num4_b, num5_b, status) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_PROGRESS')");
 
         $success_draft = $stmt->execute([
-            $hash,
-            $ref,
-            $draw_date,
-            $draw_session,
-            $start_datetime,
-            'Rwanda Broadcasting Agency (RBA) Studio, Kacyiru',
-            $_SESSION['user_id']
+            $hash, $ref, $draw_date, $draw_session, $start_datetime, $draw_date . ' 00:00:00',
+            'Rwanda Broadcasting Agency (RBA) Studio, Kacyiru', $_SESSION['user_id'],
+            $n_a[1], $n_a[2], $n_a[3], $n_a[4], $n_a[5],
+            $n_b[1], $n_b[2], $n_b[3], $n_b[4], $n_b[5]
         ]);
 
         if ($success_draft) {
@@ -234,9 +420,16 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'create_draft') {
 
 // 2. Handle MFA Code Request & Final Submission
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['ajax_action'])) {
-    $draw_id        = trim((string)($_POST['draw_id'] ?? ''));
-    $draw_hash_code = trim((string)($_POST['draw_hash_code'] ?? ''));
-    $draw_date      = trim((string)($_POST['draw_date'] ?? ''));
+    $draw_id        = trim((string)($_POST['draw_id'] ?? ($resume_draw['id'] ?? '')));
+    $draw_hash_code = trim((string)($_POST['draw_hash_code'] ?? ($resume_draw['draw_hash_code'] ?? '')));
+    $draw_date      = trim((string)($resume_draw['draw_date'] ?? ($_POST['draw_date'] ?? '')));
+    $is_backdated   = ($draw_date !== '' && $draw_date < $today_date);
+
+    $raw_start_in = $is_backdated ? ($_POST['start_time_manual'] ?? '') : ($_POST['start_time'] ?? '');
+    $raw_end_in   = $is_backdated ? ($_POST['end_time_manual'] ?? '') : ($_POST['end_time'] ?? '');
+
+    $start_time_24 = $normalize_24h_time($raw_start_in);
+    $end_time_24   = $normalize_24h_time($raw_end_in);
 
     $exception_status = $_POST['exception_status'] ?? 'NONE';
     $allowed_exceptions = ['NONE', 'MINOR_RESOLVED', 'SIGNIFICANT_EXCEPTION'];
@@ -285,8 +478,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['ajax_action'])) {
         unset($_SESSION['initiate_mfa_step']);
         $mfa_step = 1;
         $saved_photos = $persist_all_snapshots($draw_id, $draw_hash_code, $saved_photos);
-    } elseif ($draw_date === '') {
-        $error = "Error: Please select a draw date.";
+    } elseif ($draw_date === '' || $draw_date > $today_date) {
+        $error = "Error: Please select a valid draw date on or before today (" . $today_date . ").";
         $saved_photos = $persist_all_snapshots($draw_id, $draw_hash_code, $saved_photos);
     } elseif ($exception_status === 'MINOR_RESOLVED' && ($exception_details === null || $exception_details === '')) {
         $error = "Error: Please provide a brief description of the minor issue(s) noted and resolved.";
@@ -300,8 +493,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['ajax_action'])) {
     } elseif ($set_a !== $set_b) {
         $error = "Verification Mismatch: Independent Winning Number Set A does not match Set B. Please re-verify the drawn numbers.";
         $saved_photos = $persist_all_snapshots($draw_id, $draw_hash_code, $saved_photos);
-    } elseif (empty($_POST['start_time']) || empty($_POST['end_time'])) {
-        $error = "Error: Both start session and end session timestamps must be recorded.";
+    } elseif ($start_time_24 === '' || $end_time_24 === '') {
+        $error = "Error: Both start time and end time must be valid 24-hour times (HH:MM).";
+        $saved_photos = $persist_all_snapshots($draw_id, $draw_hash_code, $saved_photos);
+    } elseif ($end_time_24 <= $start_time_24) {
+        $error = "Data Quality Error: End time (" . substr($end_time_24, 0, 5) . ") must be later than start time (" . substr($start_time_24, 0, 5) . ").";
         $saved_photos = $persist_all_snapshots($draw_id, $draw_hash_code, $saved_photos);
     } elseif (isset($_POST['action_request_submit_mfa'])) {
         $saved_photos = $persist_all_snapshots($draw_id, $draw_hash_code, $saved_photos);
@@ -342,6 +538,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['ajax_action'])) {
 
         if ($attached_cnt !== REQUIRED_SNAPSHOT_COUNT) {
             $error = "Error: Exactly " . REQUIRED_SNAPSHOT_COUNT . " snapshots are required to submit (currently attached: " . $attached_cnt . " of " . REQUIRED_SNAPSHOT_COUNT . ").";
+            $_SESSION['initiate_mfa_step'] = 2;
             $mfa_step = 2;
         } else {
             $mfa_chk = $pdo->prepare("
@@ -354,13 +551,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['ajax_action'])) {
 
             if (!$valid_mfa) {
                 $error = "Invalid or expired submission MFA code. Please check your email and try again.";
+                $_SESSION['initiate_mfa_step'] = 2;
                 $mfa_step = 2;
             } else {
                 $pdo->prepare("UPDATE mfa_codes SET is_used = 1 WHERE id = ?")->execute([$valid_mfa['id']]);
 
-                $start_datetime = $draw_date . ' ' . $_POST['start_time'];
-                $end_datetime = $draw_date . ' ' . $_POST['end_time'];
-                $photos_json = json_encode(array_values($saved_photos));
+                $start_datetime = $draw_date . ' ' . $start_time_24;
+                $end_datetime   = $draw_date . ' ' . $end_time_24;
+                $photos_json    = json_encode(array_values($saved_photos));
 
                 if ($draw_id !== '' || $draw_hash_code !== '') {
                     $where_parts = [];
@@ -455,7 +653,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['ajax_action'])) {
 
                 unset($_SESSION['initiate_mfa_step']);
                 echo "<script>
-                    localStorage.removeItem('ldc_draw_form');
+                    Object.keys(localStorage).forEach(k => {
+                        if (k.startsWith('ldc_draw_form_') || k.startsWith('ldc_gps_locked_')) localStorage.removeItem(k);
+                    });
                     window.location.href = '" . BASE_URL . "Home/Draws/Review/?submitted=1&id=" . urlencode($hash_for_link) . "';
                 </script>";
                 exit;
@@ -464,16 +664,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['ajax_action'])) {
     }
 }
 
-// Resolve initial values (start blank for draw_date unless resuming/POST so user chooses and locks it)
+// Resolve initial values from pre-created/resumed draw or POST
 $val_draw_id      = (string)($_POST['draw_id'] ?? ($resume_draw['id'] ?? ''));
 $val_draw_hash    = (string)($_POST['draw_hash_code'] ?? ($resume_draw['draw_hash_code'] ?? ''));
 $val_draw_date    = (string)($_POST['draw_date'] ?? ($resume_draw['draw_date'] ?? ''));
 $val_draw_session = (string)($_POST['draw_session'] ?? ($resume_draw['draw_session'] ?? ''));
-$val_start_time   = (string)($_POST['start_time'] ?? (!empty($resume_draw['start_time']) ? date('H:i:s', strtotime((string)$resume_draw['start_time'])) : ''));
-$val_end_time     = (string)($_POST['end_time'] ?? (!empty($resume_draw['end_time']) ? date('H:i:s', strtotime((string)$resume_draw['end_time'])) : ''));
-$val_venue        = (string)($_POST['venue'] ?? ($resume_draw['venue_location'] ?? 'Rwanda Broadcasting Agency (RBA) Studio, Kacyiru'));
-$val_lat          = (string)($_POST['lat'] ?? ($resume_draw['gps_latitude'] ?? ''));
-$val_lng          = (string)($_POST['lng'] ?? ($resume_draw['gps_longitude'] ?? ''));
+
+$raw_start_time = (string)($_POST['start_time'] ?? (!empty($resume_draw['start_time']) ? date('H:i:s', strtotime((string)$resume_draw['start_time'])) : ''));
+$raw_end_time   = (string)($_POST['end_time'] ?? (!empty($resume_draw['end_time']) ? date('H:i:s', strtotime((string)$resume_draw['end_time'])) : ''));
+
+$is_initial_zero_start = ($raw_start_time === '00:00:00' && empty($_POST['start_time']) && empty($_POST['start_time_manual']));
+$is_initial_zero_end   = ($raw_end_time === '00:00:00' && empty($_POST['end_time']) && empty($_POST['end_time_manual']));
+
+$val_start_time = $is_initial_zero_start ? '' : $raw_start_time;
+$val_end_time   = $is_initial_zero_end ? '' : $raw_end_time;
+
+$val_start_manual = (string)($_POST['start_time_manual'] ?? ($val_start_time !== '' ? substr($val_start_time, 0, 5) : ''));
+$val_end_manual   = (string)($_POST['end_time_manual'] ?? ($val_end_time !== '' ? substr($val_end_time, 0, 5) : ''));
+
+$is_backdated_draw = ($val_draw_date !== '' && $val_draw_date < $today_date);
+$is_date_locked    = ($val_draw_date !== '');
+
+$val_venue = (string)($_POST['venue'] ?? ($resume_draw['venue_location'] ?? 'Rwanda Broadcasting Agency (RBA) Studio, Kacyiru'));
+$val_lat   = (string)($_POST['lat'] ?? ($resume_draw['gps_latitude'] ?? ''));
+$val_lng   = (string)($_POST['lng'] ?? ($resume_draw['gps_longitude'] ?? ''));
 
 $chk_pre_val  = isset($_POST['chk_pre']) ? true : (!empty($resume_draw['chk_pre_draw']));
 $chk_obs_val  = isset($_POST['chk_obs']) ? true : (!empty($resume_draw['chk_draw_obs']));
@@ -485,6 +699,17 @@ $curr_exc_desc   = (string)($_POST['exception_details'] ?? ($resume_draw['except
 
 $default_conclusion = "Based on the procedures performed and the evidence obtained, the scheduled draw was observed and the results verified against the agreed records. No significant exception was identified in the procedures covered by this verification.";
 $val_notes = (string)($_POST['procedure_notes'] ?? ($resume_draw['procedure_notes'] ?? $default_conclusion));
+
+// Check if all 5 numbers in DB are 0 (fresh pre-created draft) so we don't overwrite user's localStorage with 0s
+$db_has_nonzero_numbers = false;
+if ($resume_draw) {
+    for ($k = 1; $k <= 5; $k++) {
+        if ((int)($resume_draw['num' . $k . '_a'] ?? 0) !== 0 || (int)($resume_draw['num' . $k . '_b'] ?? 0) !== 0) {
+            $db_has_nonzero_numbers = true;
+            break;
+        }
+    }
+}
 
 $page_title = "Initiate Draw Verification | LDC System";
 include_once __DIR__ . '/../../../assets/includes/header.php';
@@ -597,31 +822,65 @@ $slot_labels = [
 <script>
     const RBA_LAT = -1.93843;
     const RBA_LNG = 30.08274;
+    const TODAY_DATE = <?= json_encode($today_date) ?>;
+    const IS_BACKDATED = <?= $is_backdated_draw ? 'true' : 'false' ?>;
+    const IS_DATE_LOCKED = <?= $is_date_locked ? 'true' : 'false' ?>;
     const REQUIRED_SNAPSHOTS = <?= REQUIRED_SNAPSHOT_COUNT ?>;
-    const STORAGE_KEY = 'ldc_draw_form';
+    const DRAW_KEY_SUFFIX = <?= json_encode($val_draw_hash) ?> || 'default';
+    const STORAGE_KEY = 'ldc_draw_form_' + DRAW_KEY_SUFFIX;
+    const GPS_LOCK_KEY = 'ldc_gps_locked_' + DRAW_KEY_SUFFIX;
+
+    let gpsTrackedOnce = false;
 
     function lockDrawDateInput() {
         const dateInput = document.getElementById('draw_date');
         const lockBadge = document.getElementById('date-locked-badge');
         if (!dateInput || !dateInput.value) return;
-
         dateInput.readOnly = true;
         dateInput.classList.add('date-locked');
         if (lockBadge) lockBadge.style.display = 'inline-block';
     }
 
-    function onDrawDateChosen() {
-        const dateInput = document.getElementById('draw_date');
-        if (!dateInput || !dateInput.value) return;
+    function applyTimingMode() {
+        const manualBox = document.getElementById('backdate-clock-controls');
+        const autoBox   = document.getElementById('live-auto-controls');
+        const submitBtn = document.getElementById('submit-btn');
 
-        lockDrawDateInput();
-        saveFormBackup();
+        if (IS_BACKDATED) {
+            if (manualBox) manualBox.style.display = 'block';
+            if (autoBox) autoBox.style.display = 'none';
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                submitBtn.style.opacity = '1';
+                submitBtn.title = '';
+            }
+        } else {
+            if (manualBox) manualBox.style.display = 'none';
+            if (autoBox) autoBox.style.display = 'block';
+        }
     }
 
-    function resetEntireForm() {
-        if (!confirm("Clear all locally saved form data and start fresh?")) return;
-        localStorage.removeItem(STORAGE_KEY);
-        window.location.href = window.location.pathname;
+    function validateManualClockOrder() {
+        if (!IS_BACKDATED) return true;
+        const sEl = document.getElementById('start_time_manual');
+        const eEl = document.getElementById('end_time_manual');
+        const warnEl = document.getElementById('clock-order-warning');
+        if (!sEl || !eEl) return true;
+
+        const sVal = sEl.value.trim();
+        const eVal = eEl.value.trim();
+        if (sVal && eVal && eVal <= sVal) {
+            if (warnEl) {
+                warnEl.textContent = 'End time (' + eVal + ') must be later than start time (' + sVal + ').';
+                warnEl.style.display = 'block';
+            }
+            return false;
+        }
+        if (warnEl) {
+            warnEl.style.display = 'none';
+            warnEl.textContent = '';
+        }
+        return true;
     }
 
     function calculateDistance(lat1, lon1, lat2, lon2) {
@@ -636,31 +895,59 @@ $slot_labels = [
         return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
     }
 
-    function renderGpsSuccess(position) {
-        const userLat = position.coords.latitude;
-        const userLng = position.coords.longitude;
-        const acc = position.coords.accuracy ? Math.round(position.coords.accuracy) : null;
-
+    function lockGpsUI(lat, lng, htmlMessage) {
+        gpsTrackedOnce = true;
         const latEl = document.getElementById('lat');
         const lngEl = document.getElementById('lng');
         const statusEl = document.getElementById('loc-status');
 
-        if (latEl) latEl.value = userLat;
-        if (lngEl) lngEl.value = userLng;
+        if (latEl) latEl.value = lat;
+        if (lngEl) lngEl.value = lng;
+        if (statusEl) {
+            statusEl.innerHTML = htmlMessage + ' <span style="background:#e9ecef;color:#333;padding:2px 6px;border-radius:3px;font-size:0.72rem;margin-left:4px;"><i class="fa-solid fa-lock"></i> Locked</span>';
+        }
+        localStorage.setItem(GPS_LOCK_KEY, JSON.stringify({ lat: lat, lng: lng, html: htmlMessage }));
+    }
+
+    function renderGpsSuccess(position) {
+        if (gpsTrackedOnce) return;
+        const userLat = position.coords.latitude;
+        const userLng = position.coords.longitude;
+        const acc = position.coords.accuracy ? Math.round(position.coords.accuracy) : null;
 
         const dist = calculateDistance(userLat, userLng, RBA_LAT, RBA_LNG);
         const distText = dist < 1000 ? Math.round(dist) + " meters" : (dist / 1000).toFixed(2) + " km";
         const accText = acc !== null ? " (±" + acc + "m)" : "";
 
-        if (statusEl) {
-            statusEl.innerHTML = '<i class="fa-solid fa-location-dot" style="color: var(--jade);"></i> GPS Active (' +
-                userLat.toFixed(5) + ', ' + userLng.toFixed(5) + ')' + accText +
-                ' — <strong>' + distText + '</strong> from RBA Studio.';
-        }
+        const msg = '<i class="fa-solid fa-location-dot" style="color: var(--jade);"></i> GPS Captured (' +
+            userLat.toFixed(5) + ', ' + userLng.toFixed(5) + ')' + accText +
+            ' — <strong>' + distText + '</strong> from RBA Studio.';
+
+        lockGpsUI(userLat, userLng, msg);
+        saveFormBackup();
     }
 
-    function captureLocation(highAccuracy = true) {
+    function captureLocation(highAccuracy = true, forceUnlock = false) {
         const statusEl = document.getElementById('loc-status');
+
+        if (forceUnlock) {
+            gpsTrackedOnce = false;
+            localStorage.removeItem(GPS_LOCK_KEY);
+        }
+
+        if (gpsTrackedOnce) return;
+
+        // If already tracked once for this draw, restore and keep locked
+        const cachedGps = localStorage.getItem(GPS_LOCK_KEY);
+        if (cachedGps && !forceUnlock) {
+            try {
+                const g = JSON.parse(cachedGps);
+                if (g && g.lat && g.lng && g.html) {
+                    lockGpsUI(g.lat, g.lng, g.html);
+                    return;
+                }
+            } catch (e) {}
+        }
 
         if (!navigator.geolocation) {
             if (statusEl) {
@@ -680,14 +967,15 @@ $slot_labels = [
 
         if (statusEl) {
             statusEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> ' +
-                (highAccuracy ? 'Acquiring GPS coordinates...' : 'Trying network/coarse location...');
+                (highAccuracy ? 'Tracking GPS once...' : 'Trying network/coarse location...');
         }
 
         navigator.geolocation.getCurrentPosition(
             renderGpsSuccess,
             function(error) {
+                if (gpsTrackedOnce) return;
                 if (highAccuracy && (error.code === error.TIMEOUT || error.code === error.POSITION_UNAVAILABLE)) {
-                    captureLocation(false);
+                    captureLocation(false, false);
                     return;
                 }
 
@@ -707,7 +995,7 @@ $slot_labels = [
             {
                 enableHighAccuracy: highAccuracy,
                 timeout: highAccuracy ? 10000 : 15000,
-                maximumAge: 30000
+                maximumAge: 86400000
             }
         );
     }
@@ -731,13 +1019,7 @@ $slot_labels = [
     }
 
     function startDrawSession() {
-        const chosenDate = document.getElementById('draw_date').value;
-        if (!chosenDate) {
-            alert("Please select a Draw Date first.");
-            document.getElementById('draw_date').focus();
-            return;
-        }
-
+        const chosenDate = document.getElementById('draw_date').value || TODAY_DATE;
         const sessionName = document.querySelector('input[name="draw_session"]').value.trim();
         if (!sessionName) {
             alert("Please enter a Draw Session Name before starting the session.");
@@ -746,16 +1028,12 @@ $slot_labels = [
         }
 
         if (confirm("SMART WARNING: Clicking OK records the exact live start timestamp and saves a secure draft in the database. Proceed?")) {
-            const existingStart = document.getElementById('start_time').value.trim();
             const now = new Date();
-            const timeString = existingStart || (
-                String(now.getHours()).padStart(2, '0') + ':' +
-                String(now.getMinutes()).padStart(2, '0') + ':' +
-                String(now.getSeconds()).padStart(2, '0')
-            );
+            const timeString = String(now.getHours()).padStart(2, '0') + ':' +
+                               String(now.getMinutes()).padStart(2, '0') + ':' +
+                               String(now.getSeconds()).padStart(2, '0');
 
             document.getElementById('start_time').value = timeString;
-            lockDrawDateInput();
 
             const formData = new FormData();
             formData.append('ajax_action', 'create_draft');
@@ -764,6 +1042,10 @@ $slot_labels = [
             formData.append('draw_date', chosenDate);
             formData.append('draw_session', sessionName);
             formData.append('start_time', timeString);
+            for (let i = 1; i <= 5; i++) {
+                formData.append('n' + i + '_a', document.getElementById('seta_n' + i).value);
+                formData.append('n' + i + '_b', document.getElementById('setb_n' + i).value);
+            }
 
             fetch(window.location.href, {
                 method: 'POST',
@@ -791,12 +1073,12 @@ $slot_labels = [
                     document.getElementById('session-saved-notice').innerHTML = '<i class="fa-solid fa-cloud-arrow-up" style="color: var(--jade);"></i> Draft securely saved (Ref: ' + data.ref + ')';
                     saveFormBackup();
                 } else {
-                    if (!existingStart) document.getElementById('start_time').value = '';
+                    document.getElementById('start_time').value = '';
                     alert("Draft creation error: " + (data.message || 'Unknown error'));
                 }
             })
             .catch(err => {
-                if (!existingStart) document.getElementById('start_time').value = '';
+                document.getElementById('start_time').value = '';
                 alert("Draft Error: " + err.message);
             });
         }
@@ -849,12 +1131,33 @@ $slot_labels = [
         }
     }
 
+    // Dedicated camera trigger (rear camera) while file input stays open for gallery/files
     function triggerInstantCamera(slotIdx) {
-        const inp = document.getElementById('snapshot_file_' + slotIdx);
-        if (inp) {
-            inp.setAttribute('capture', 'environment');
-            inp.click();
+        const camInp = document.getElementById('snapshot_cam_' + slotIdx);
+        if (camInp) {
+            camInp.value = '';
+            camInp.click();
         }
+    }
+
+    function handleSnapshotSelection(sourceInput, slotIdx) {
+        if (!sourceInput || !sourceInput.files || !sourceInput.files[0]) {
+            refreshSnapshotCounter();
+            return;
+        }
+
+        const file = sourceInput.files[0];
+        const mainFileInp = document.getElementById('snapshot_file_' + slotIdx);
+        const camInp = document.getElementById('snapshot_cam_' + slotIdx);
+
+        // If captured via the camera button, copy into the main file input so PHP POST receives it too
+        if (camInp && sourceInput === camInp && mainFileInp && typeof DataTransfer !== 'undefined') {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            mainFileInp.files = dt.files;
+        }
+
+        previewSnapshotSlot(mainFileInp || sourceInput, slotIdx);
     }
 
     function refreshSnapshotCounter() {
@@ -891,20 +1194,67 @@ $slot_labels = [
         const box = document.getElementById('snapshot_preview_box_' + slotIdx);
         const img = document.getElementById('snapshot_preview_img_' + slotIdx);
         const cap = document.getElementById('snapshot_preview_cap_' + slotIdx);
+        const hiddenJson = document.getElementById('existing_photos_json');
 
-        if (input.files && input.files[0]) {
-            const file = input.files[0];
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                if (img) img.src = e.target.result;
-                if (cap) cap.textContent = file.name + ' (' + Math.round(file.size / 1024) + ' KB)';
-                if (box) box.style.display = 'block';
-                refreshSnapshotCounter();
-            };
-            reader.readAsDataURL(file);
-        } else {
+        if (!input || !input.files || !input.files[0]) {
             refreshSnapshotCounter();
+            return;
         }
+
+        const file = input.files[0];
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            if (img) img.src = e.target.result;
+            if (cap) cap.textContent = file.name + ' — saving...';
+            if (box) box.style.display = 'block';
+        };
+        reader.readAsDataURL(file);
+
+        const drawId = (document.getElementById('draw_id')?.value || '').trim();
+        const drawHash = (document.getElementById('draw_hash_code')?.value || '').trim();
+
+        if (!drawId && !drawHash) {
+            if (cap) cap.textContent = file.name + ' (attached locally; start session or submit to store)';
+            refreshSnapshotCounter();
+            return;
+        }
+
+        const fd = new FormData();
+        fd.append('ajax_action', 'upload_snapshot');
+        fd.append('slot_index', String(slotIdx));
+        fd.append('draw_id', drawId);
+        fd.append('draw_hash_code', drawHash);
+        fd.append('snapshot_file', file);
+
+        fetch(window.location.href, {
+            method: 'POST',
+            body: fd,
+            credentials: 'same-origin'
+        })
+        .then(async res => {
+            const txt = await res.text();
+            try {
+                return JSON.parse(txt);
+            } catch (e) {
+                throw new Error(txt.substring(0, 140) || 'Invalid upload response');
+            }
+        })
+        .then(data => {
+            if (data.status === 'success' && Array.isArray(data.photos)) {
+                if (hiddenJson) hiddenJson.value = JSON.stringify(data.photos);
+                if (img && data.url) img.src = data.url;
+                if (cap) cap.textContent = file.name + ' (saved)';
+                const mainInp = document.getElementById('snapshot_file_' + slotIdx);
+                if (mainInp) mainInp.required = false;
+                refreshSnapshotCounter();
+            } else {
+                throw new Error(data.message || 'Upload failed');
+            }
+        })
+        .catch(err => {
+            if (cap) cap.textContent = file.name + ' (upload error: ' + err.message + ')';
+            refreshSnapshotCounter();
+        });
     }
 
     function saveFormBackup() {
@@ -913,15 +1263,17 @@ $slot_labels = [
             draw_hash_code: String(document.getElementById('draw_hash_code').value || ''),
             draw_date: document.getElementById('draw_date').value,
             draw_session: document.querySelector('input[name="draw_session"]').value,
-            start_time: document.getElementById('start_time').value,
-            end_time: document.getElementById('end_time').value,
+            start_time: document.getElementById('start_time') ? document.getElementById('start_time').value : '',
+            end_time: document.getElementById('end_time') ? document.getElementById('end_time').value : '',
+            start_time_manual: document.getElementById('start_time_manual') ? document.getElementById('start_time_manual').value : '',
+            end_time_manual: document.getElementById('end_time_manual') ? document.getElementById('end_time_manual').value : '',
             venue: document.querySelector('input[name="venue"]').value,
             procedure_notes: document.querySelector('textarea[name="procedure_notes"]').value,
             chk_pre: document.querySelector('input[name="chk_pre"]').checked,
             chk_obs: document.querySelector('input[name="chk_obs"]').checked,
             chk_post: document.querySelector('input[name="chk_post"]').checked,
-            seta: [1, 2, 3, 4, 5].map(i => document.getElementById('seta_n' + i).value),
-            setb: [1, 2, 3, 4, 5].map(i => document.getElementById('setb_n' + i).value),
+            seta: [1, 2, 3, 4, 5].map(i => String(document.getElementById('seta_n' + i).value ?? '')),
+            setb: [1, 2, 3, 4, 5].map(i => String(document.getElementById('setb_n' + i).value ?? '')),
             exception_status: (document.querySelector('input[name="exception_status"]:checked') || { value: 'NONE' }).value,
             exception_report_ref: document.getElementById('exception_report_ref') ? document.getElementById('exception_report_ref').value : '',
             exception_details: document.getElementById('exception_details') ? document.getElementById('exception_details').value : ''
@@ -930,7 +1282,7 @@ $slot_labels = [
     }
 
     window.addEventListener('DOMContentLoaded', function() {
-        captureLocation(true);
+        applyTimingMode();
 
         const startTimeEl = document.getElementById('start_time');
         const endTimeEl = document.getElementById('end_time');
@@ -939,24 +1291,25 @@ $slot_labels = [
         const startedBadge = document.getElementById('session-started-badge');
         const submitBtn = document.getElementById('submit-btn');
 
-        // Restore saved form state on reload so user never loses entered data
         const saved = localStorage.getItem(STORAGE_KEY);
         if (saved) {
             try {
                 const data = JSON.parse(saved);
-                const drawIdEl = document.getElementById('draw_id');
-                const drawHashEl = document.getElementById('draw_hash_code');
-                const drawDateEl = document.getElementById('draw_date');
                 const sessionEl = document.querySelector('input[name="draw_session"]');
                 const venueEl = document.querySelector('input[name="venue"]');
                 const notesEl = document.querySelector('textarea[name="procedure_notes"]');
 
-                if (drawIdEl && !drawIdEl.value && data.draw_id) drawIdEl.value = String(data.draw_id);
-                if (drawHashEl && !drawHashEl.value && data.draw_hash_code) drawHashEl.value = String(data.draw_hash_code);
-                if (drawDateEl && !drawDateEl.value && data.draw_date) drawDateEl.value = data.draw_date;
-                if (sessionEl && !sessionEl.value && data.draw_session) sessionEl.value = data.draw_session;
+                if (sessionEl && data.draw_session && !<?= isset($_POST['draw_session']) ? 'true' : 'false' ?>) {
+                    sessionEl.value = data.draw_session;
+                }
                 if (startTimeEl && !startTimeEl.value && data.start_time) startTimeEl.value = data.start_time;
                 if (endTimeEl && !endTimeEl.value && data.end_time) endTimeEl.value = data.end_time;
+
+                const sMan = document.getElementById('start_time_manual');
+                const eMan = document.getElementById('end_time_manual');
+                if (sMan && !sMan.value && data.start_time_manual) sMan.value = data.start_time_manual;
+                if (eMan && !eMan.value && data.end_time_manual) eMan.value = data.end_time_manual;
+
                 if (venueEl && data.venue && !<?= isset($_POST['venue']) ? 'true' : 'false' ?>) venueEl.value = data.venue;
                 if (notesEl && data.procedure_notes && !<?= isset($_POST['procedure_notes']) ? 'true' : 'false' ?>) notesEl.value = data.procedure_notes;
 
@@ -970,16 +1323,21 @@ $slot_labels = [
                     document.querySelector('input[name="chk_post"]').checked = data.chk_post;
                 }
 
+                // Restore Set A & Set B numbers whenever localStorage has them
                 if (Array.isArray(data.seta)) {
                     data.seta.forEach((val, idx) => {
                         const inp = document.getElementById('seta_n' + (idx + 1));
-                        if (inp && inp.value === '' && val !== '') inp.value = val;
+                        if (inp && val !== '' && val !== undefined && val !== null) {
+                            inp.value = String(val);
+                        }
                     });
                 }
                 if (Array.isArray(data.setb)) {
                     data.setb.forEach((val, idx) => {
                         const inp = document.getElementById('setb_n' + (idx + 1));
-                        if (inp && inp.value === '' && val !== '') inp.value = val;
+                        if (inp && val !== '' && val !== undefined && val !== null) {
+                            inp.value = String(val);
+                        }
                     });
                 }
 
@@ -1000,62 +1358,74 @@ $slot_labels = [
             }
         }
 
-        // Lock the date field if a date has already been chosen (or restored)
-        if (document.getElementById('draw_date')?.value) {
+        // Track GPS once (or restore locked GPS)
+        captureLocation(true, false);
+
+        if (IS_DATE_LOCKED || document.getElementById('draw_date')?.value) {
             lockDrawDateInput();
         }
 
         toggleExceptionFields();
+        validateManualClockOrder();
         refreshSnapshotCounter();
 
-        const startTimeVal = startTimeEl ? startTimeEl.value : '';
-        const endTimeVal = endTimeEl ? endTimeEl.value : '';
+        if (!IS_BACKDATED) {
+            const startTimeVal = startTimeEl ? startTimeEl.value : '';
+            const endTimeVal = endTimeEl ? endTimeEl.value : '';
 
-        if (startTimeVal) {
-            if (startBtn) startBtn.style.display = 'none';
-            if (startedBadge) startedBadge.style.display = 'inline-block';
-        }
+            if (startTimeVal) {
+                if (startBtn) startBtn.style.display = 'none';
+                if (startedBadge) startedBadge.style.display = 'inline-block';
+            }
 
-        if (endTimeVal) {
-            if (endBtn) {
-                endBtn.disabled = true;
-                endBtn.innerText = "Session Concluded";
-                endBtn.style.opacity = '0.6';
+            if (endTimeVal) {
+                if (endBtn) {
+                    endBtn.disabled = true;
+                    endBtn.innerText = "Session Concluded";
+                    endBtn.style.opacity = '0.6';
+                }
+                if (submitBtn) {
+                    submitBtn.disabled = false;
+                    submitBtn.style.opacity = '1';
+                }
+            } else if (startTimeVal && endBtn) {
+                endBtn.disabled = false;
+                endBtn.style.opacity = '1';
             }
-            if (submitBtn) {
-                submitBtn.disabled = false;
-                submitBtn.style.opacity = '1';
-            }
-        } else if (startTimeVal && endBtn) {
-            endBtn.disabled = false;
-            endBtn.style.opacity = '1';
         }
 
         updateBallPreview('seta');
         updateBallPreview('setb');
 
-        document.querySelectorAll('input, textarea').forEach(el => {
-            el.addEventListener('input', saveFormBackup);
-            el.addEventListener('change', saveFormBackup);
+        document.querySelectorAll('input, textarea, select').forEach(el => {
+            if (el.type === 'file') return;
+            el.addEventListener('input', () => {
+                validateManualClockOrder();
+                saveFormBackup();
+            });
+            el.addEventListener('change', () => {
+                validateManualClockOrder();
+                saveFormBackup();
+            });
         });
     });
 </script>
 
 <main class="main-content">
-    <div style="background: var(--charcoal); color: #fff; padding: 20px; border-radius: 4px; margin-bottom: 20px; border-left: 6px solid var(--red); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
-        <div>
-            <h2><i class="fa-solid fa-dice"></i> Initiate Draw Session Verification</h2>
-            <p style="font-size: 0.85rem; color: var(--pale-charcoal);">Select your draw date (locks once chosen), complete the verification checklist, and attach <?= REQUIRED_SNAPSHOT_COUNT ?> snapshots before submission.</p>
-        </div>
-        <button type="button" onclick="resetEntireForm()" style="background: transparent; color: #fff; border: 1px solid rgba(255,255,255,0.4); padding: 6px 12px; border-radius: 4px; font-size: 0.78rem; cursor: pointer;">
-            <i class="fa-solid fa-rotate-right"></i> Clear / New Form
-        </button>
+    <div style="background: var(--charcoal); color: #fff; padding: 20px; border-radius: 4px; margin-bottom: 20px; border-left: 6px solid var(--red);">
+        <h2><i class="fa-solid fa-dice"></i> Initiate Draw Session Verification</h2>
+        <p style="font-size: 0.85rem; color: var(--pale-charcoal);">
+            <?php if ($val_draw_hash !== ''): ?>
+                Hashcode: <code style="color:#fff;"><?= htmlspecialchars($val_draw_hash) ?></code> ·
+            <?php endif; ?>
+            <?= $is_backdated_draw ? 'Backdated session detected: pick start and end hour/minute on the clock (stored in 24h, shown AM/PM on reports).' : 'Live/current session: use Start & End controls to record timestamps automatically.' ?>
+        </p>
     </div>
 
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
             <p id="loc-status" style="font-weight: bold; font-size: 0.85rem; margin: 0;"><i class="fa-solid fa-spinner fa-spin"></i> Checking GPS location...</p>
-            <button type="button" onclick="captureLocation(true)" class="gps-retry-btn" title="Refresh GPS Coordinates">
+            <button type="button" onclick="captureLocation(true, true)" class="gps-retry-btn" title="Unlock and Refresh GPS Coordinates">
                 <i class="fa-solid fa-rotate"></i> Retry GPS
             </button>
         </div>
@@ -1076,12 +1446,12 @@ $slot_labels = [
         <input type="hidden" name="lat" id="lat" value="<?= htmlspecialchars($val_lat) ?>">
         <input type="hidden" name="lng" id="lng" value="<?= htmlspecialchars($val_lng) ?>">
 
-        <!-- Draw Date (Locks once chosen) & Session Name -->
+        <!-- Locked Draw Date & Session Name -->
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
             <div>
                 <div style="display: flex; justify-content: space-between; align-items: center;">
                     <label style="font-size: 0.85rem; font-weight: 600;">Draw Date</label>
-                    <span id="date-locked-badge" style="display: none; font-size: 0.72rem; font-weight: 700; color: var(--burgundy);">
+                    <span id="date-locked-badge" style="display: <?= $is_date_locked ? 'inline-block' : 'none' ?>; font-size: 0.72rem; font-weight: 700; color: var(--burgundy);">
                         <i class="fa-solid fa-lock"></i> Locked
                     </span>
                 </div>
@@ -1089,7 +1459,8 @@ $slot_labels = [
                        name="draw_date"
                        id="draw_date"
                        value="<?= htmlspecialchars($val_draw_date) ?>"
-                       onchange="onDrawDateChosen()"
+                       max="<?= htmlspecialchars($today_date) ?>"
+                       <?= $is_date_locked ? 'readonly class="date-locked"' : '' ?>
                        required
                        style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;">
             </div>
@@ -1099,32 +1470,66 @@ $slot_labels = [
             </div>
         </div>
 
-        <!-- Always-Open Draw Details -->
+        <!-- Timing Section: Clock Hour/Minute when Backdated, Automatic Start/End when Current/Live -->
         <div id="draw-details-fields">
             <div style="background: #f4f6f9; padding: 15px; border-radius: 4px; border: 1px solid var(--pale-charcoal); margin-bottom: 20px;">
-                <h4 style="color: var(--charcoal); margin-bottom: 10px;"><i class="fa-solid fa-stopwatch"></i> Live Session Timing Controls &amp; Instant Draft Locking</h4>
-                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; align-items: center;">
-                    <div>
-                        <label style="font-size: 0.85rem; font-weight: 600;">Start Time (Preserved)</label>
-                        <input type="text" name="start_time" id="start_time" value="<?= htmlspecialchars($val_start_time) ?>" required readonly style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px; background: #e9ecef;">
+                <h4 style="color: var(--charcoal); margin-bottom: 10px;">
+                    <i class="fa-solid fa-stopwatch"></i> Session Timing Controls
+                </h4>
+
+                <!-- Backdated: Clock Picker (Hour & Minute) -->
+                <div id="backdate-clock-controls" style="display: <?= $is_backdated_draw ? 'block' : 'none' ?>;">
+                    <p style="font-size: 0.8rem; color: var(--slate); margin: 0 0 10px;">
+                        Backdated draw (<strong><?= htmlspecialchars($val_draw_date) ?></strong> &lt; <strong><?= htmlspecialchars($today_date) ?></strong>): choose hour and minute on the clock (end time must be after start time).
+                    </p>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                        <div>
+                            <label for="start_time_manual" style="font-size: 0.85rem; font-weight: 600;">Start Time (Hour &amp; Minute)</label>
+                            <input type="time"
+                                   name="start_time_manual"
+                                   id="start_time_manual"
+                                   step="60"
+                                   value="<?= htmlspecialchars($val_start_manual) ?>"
+                                   style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); border-radius: 4px; margin-top: 4px; background: #fff; font-weight: 600;">
+                        </div>
+                        <div>
+                            <label for="end_time_manual" style="font-size: 0.85rem; font-weight: 600;">End Time (Hour &amp; Minute)</label>
+                            <input type="time"
+                                   name="end_time_manual"
+                                   id="end_time_manual"
+                                   step="60"
+                                   value="<?= htmlspecialchars($val_end_manual) ?>"
+                                   style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); border-radius: 4px; margin-top: 4px; background: #fff; font-weight: 600;">
+                        </div>
                     </div>
-                    <div>
-                        <label style="font-size: 0.85rem; font-weight: 600;">End Time (Preserved)</label>
-                        <input type="text" name="end_time" id="end_time" value="<?= htmlspecialchars($val_end_time) ?>" required readonly style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px; background: #e9ecef;">
-                    </div>
-                    <div style="display: flex; gap: 8px; align-items: flex-end; padding-top: 20px;">
-                        <button type="button" id="start-session-btn" onclick="startDrawSession()" style="background: var(--jade); color: #fff; border: none; padding: 10px 14px; font-weight: bold; border-radius: 4px; cursor: pointer;">
-                            <i class="fa-solid fa-play"></i> Start Session &amp; Save Draft
-                        </button>
-                        <button type="button" id="end-session-btn" onclick="endDrawSession()" disabled style="background: var(--burgundy); color: #fff; border: none; padding: 10px 14px; font-weight: bold; border-radius: 4px; cursor: pointer; opacity: 0.6;">
-                            <i class="fa-solid fa-stop"></i> End Session
-                        </button>
-                    </div>
+                    <div id="clock-order-warning" style="display:none; color:#842029; font-size:0.78rem; font-weight:700; margin-top:8px;"></div>
                 </div>
-                <div style="margin-top: 10px;">
-                    <span id="session-started-badge" style="display: none; background: var(--jade); color: #fff; padding: 3px 8px; font-size: 0.75rem; font-weight: bold; border-radius: 3px;">
-                        <i class="fa-solid fa-circle-check"></i> Session Active &amp; Draft Locked in DB
-                    </span>
+
+                <!-- Current/Live Date: Automatic Start & End Controls -->
+                <div id="live-auto-controls" style="display: <?= $is_backdated_draw ? 'none' : 'block' ?>;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; align-items: center;">
+                        <div>
+                            <label style="font-size: 0.85rem; font-weight: 600;">Start Time (Auto-Recorded)</label>
+                            <input type="text" name="start_time" id="start_time" value="<?= htmlspecialchars($val_start_time) ?>" readonly style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px; background: #e9ecef;">
+                        </div>
+                        <div>
+                            <label style="font-size: 0.85rem; font-weight: 600;">End Time (Auto-Recorded)</label>
+                            <input type="text" name="end_time" id="end_time" value="<?= htmlspecialchars($val_end_time) ?>" readonly style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px; background: #e9ecef;">
+                        </div>
+                        <div style="display: flex; gap: 8px; align-items: flex-end; padding-top: 20px;">
+                            <button type="button" id="start-session-btn" onclick="startDrawSession()" style="background: var(--jade); color: #fff; border: none; padding: 10px 14px; font-weight: bold; border-radius: 4px; cursor: pointer;">
+                                <i class="fa-solid fa-play"></i> Start Session
+                            </button>
+                            <button type="button" id="end-session-btn" onclick="endDrawSession()" disabled style="background: var(--burgundy); color: #fff; border: none; padding: 10px 14px; font-weight: bold; border-radius: 4px; cursor: pointer; opacity: 0.6;">
+                                <i class="fa-solid fa-stop"></i> End Session
+                            </button>
+                        </div>
+                    </div>
+                    <div style="margin-top: 10px;">
+                        <span id="session-started-badge" style="display: none; background: var(--jade); color: #fff; padding: 3px 8px; font-size: 0.75rem; font-weight: bold; border-radius: 3px;">
+                            <i class="fa-solid fa-circle-check"></i> Session Active
+                        </span>
+                    </div>
                 </div>
             </div>
 
@@ -1188,7 +1593,15 @@ $slot_labels = [
                     <p style="font-size: 0.85rem; font-weight: 600; color: var(--charcoal); margin-bottom: 8px;"><i class="fa-solid fa-pen-nib"></i> Primary Record Entry (Set A):</p>
                     <div style="display: flex; gap: 8px;">
                         <?php for ($i = 1; $i <= 5; $i++): ?>
-                            <?php $n_a_val = $_POST['n'.$i.'_a'] ?? (isset($resume_draw['num'.$i.'_a']) && $resume_draw['num'.$i.'_a'] !== null ? (string)$resume_draw['num'.$i.'_a'] : ''); ?>
+                            <?php
+                            if (isset($_POST['n'.$i.'_a'])) {
+                                $n_a_val = (string)$_POST['n'.$i.'_a'];
+                            } elseif ($db_has_nonzero_numbers && isset($resume_draw['num'.$i.'_a']) && $resume_draw['num'.$i.'_a'] !== null) {
+                                $n_a_val = (string)$resume_draw['num'.$i.'_a'];
+                            } else {
+                                $n_a_val = '';
+                            }
+                            ?>
                             <input type="number" name="n<?= $i ?>_a" id="seta_n<?= $i ?>" value="<?= htmlspecialchars($n_a_val) ?>" min="0" max="90" step="1" inputmode="numeric" pattern="[0-9]*" required placeholder="0-90" oninput="validateAndPreview(this, 'seta')" style="width: 65px; padding: 8px; text-align: center; font-weight: bold;">
                         <?php endfor; ?>
                     </div>
@@ -1208,7 +1621,15 @@ $slot_labels = [
                     <p style="font-size: 0.85rem; font-weight: 600; color: var(--charcoal); margin-bottom: 8px;"><i class="fa-solid fa-copy"></i> Independent Dual-Control Re-entry (Set B):</p>
                     <div style="display: flex; gap: 8px;">
                         <?php for ($i = 1; $i <= 5; $i++): ?>
-                            <?php $n_b_val = $_POST['n'.$i.'_b'] ?? (isset($resume_draw['num'.$i.'_b']) && $resume_draw['num'.$i.'_b'] !== null ? (string)$resume_draw['num'.$i.'_b'] : ''); ?>
+                            <?php
+                            if (isset($_POST['n'.$i.'_b'])) {
+                                $n_b_val = (string)$_POST['n'.$i.'_b'];
+                            } elseif ($db_has_nonzero_numbers && isset($resume_draw['num'.$i.'_b']) && $resume_draw['num'.$i.'_b'] !== null) {
+                                $n_b_val = (string)$resume_draw['num'.$i.'_b'];
+                            } else {
+                                $n_b_val = '';
+                            }
+                            ?>
                             <input type="number" name="n<?= $i ?>_b" id="setb_n<?= $i ?>" value="<?= htmlspecialchars($n_b_val) ?>" min="0" max="90" step="1" inputmode="numeric" pattern="[0-9]*" required placeholder="0-90" oninput="validateAndPreview(this, 'setb')" style="width: 65px; padding: 8px; text-align: center; font-weight: bold;">
                         <?php endfor; ?>
                     </div>
@@ -1224,7 +1645,7 @@ $slot_labels = [
                 </div>
             </div>
 
-            <!-- Multiple Snapshots (Exactly 3) -->
+            <!-- Multiple Snapshots (Exactly 3) — Gallery/File Picker + Instant Camera Option -->
             <div style="margin-bottom: 25px;">
                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
                     <label style="font-size: 0.85rem; font-weight: 700; color: var(--charcoal);">
@@ -1235,7 +1656,7 @@ $slot_labels = [
                     </span>
                 </div>
                 <p style="font-size: 0.76rem; color: var(--slate); margin: 4px 0 8px;">
-                    On mobile, tap <strong>Take Photo</strong> to launch the camera immediately, or choose an image file from your device.
+                    Choose an image from your gallery/files or tap <strong>Take Photo</strong> to snap directly with your camera. Each photo saves automatically so refreshing won't lose it.
                 </p>
 
                 <div class="snapshots-grid">
@@ -1247,19 +1668,27 @@ $slot_labels = [
                                     <span style="font-size: 0.8rem; font-weight: 700; color: var(--charcoal);">
                                         <?= htmlspecialchars($slot_labels[$s] ?? ('Snapshot ' . ($s + 1))) ?>
                                     </span>
-                                    <button type="button" onclick="triggerInstantCamera(<?= $s ?>)" class="cam-trigger-btn" title="Open Camera Instantly">
+                                    <button type="button" onclick="triggerInstantCamera(<?= $s ?>)" class="cam-trigger-btn" title="Take Photo with Camera">
                                         <i class="fa-solid fa-camera"></i> Take Photo
                                     </button>
                                 </div>
 
+                                <!-- Standard gallery / file picker (no capture attribute) -->
                                 <input type="file"
                                        name="central_photos[<?= $s ?>]"
                                        id="snapshot_file_<?= $s ?>"
                                        accept="image/*"
-                                       capture="environment"
-                                       onchange="previewSnapshotSlot(this, <?= $s ?>)"
+                                       onchange="handleSnapshotSelection(this, <?= $s ?>)"
                                        <?= $slot_saved === '' ? 'required' : '' ?>
                                        style="width: 100%; font-size: 0.76rem;">
+
+                                <!-- Dedicated rear-camera input -->
+                                <input type="file"
+                                       id="snapshot_cam_<?= $s ?>"
+                                       accept="image/*"
+                                       capture="environment"
+                                       onchange="handleSnapshotSelection(this, <?= $s ?>)"
+                                       style="display: none;">
                             </div>
 
                             <div id="snapshot_preview_box_<?= $s ?>" class="snapshot-thumb-box" style="display: <?= $slot_saved !== '' ? 'block' : 'none' ?>;">
@@ -1267,7 +1696,7 @@ $slot_labels = [
                                      src="<?= $slot_saved !== '' ? htmlspecialchars(BASE_URL . ltrim($slot_saved, '/')) : '' ?>"
                                      alt="Snapshot <?= $s + 1 ?> Preview">
                                 <div id="snapshot_preview_cap_<?= $s ?>" style="font-size: 0.72rem; color: var(--slate); margin-top: 5px; word-break: break-all;">
-                                    <?= $slot_saved !== '' ? htmlspecialchars(basename($slot_saved)) : '' ?>
+                                    <?= $slot_saved !== '' ? htmlspecialchars(basename($slot_saved)) . ' (saved)' : '' ?>
                                 </div>
                             </div>
                         </div>
@@ -1277,12 +1706,12 @@ $slot_labels = [
 
             <div style="margin-bottom: 20px;">
                 <label style="font-size: 0.85rem; font-weight: 600;">Verification Conclusion</label>
-                <textarea name="procedure_notes" rows="2" placeholder="Verification Conclusion" style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;"><?= htmlspecialchars($val_notes) ?></textarea>
+                <textarea name="procedure_notes" rows="2" placeholder="Verification Conclusion" style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;"><?= htmlspecialchars($val_notes) ?>Based on the procedures performed and the evidence obtained, the scheduled draw was observed and the results verified against the agreed records. No significant exception was identified in the procedures covered by this verification.</textarea>
             </div>
 
             <!-- MFA Step 1 vs Step 2 Submission Controls -->
-            <?php if ($mfa_step === 1): ?>s
-                <button type="submit" name="action_request_submit_mfa" id="submit-btn" disabled class="flat-cta" style="cursor: pointer; background: var(--red); color: #fff; border: none; padding: 12px 25px; border-radius: 4px; font-weight: bold; opacity: 0.6;" title="Conclude session to enable submission">
+            <?php if ($mfa_step === 1): ?>
+                <button type="submit" name="action_request_submit_mfa" id="submit-btn" <?= $is_backdated_draw ? '' : 'disabled' ?> class="flat-cta" style="cursor: pointer; background: var(--red); color: #fff; border: none; padding: 12px 25px; border-radius: 4px; font-weight: bold; opacity: <?= $is_backdated_draw ? '1' : '0.6' ?>;" title="<?= $is_backdated_draw ? '' : 'Conclude session to enable submission' ?>">
                     <i class="fa-solid fa-envelope-circle-check"></i> Send MFA Code to Submit
                 </button>
             <?php else: ?>
