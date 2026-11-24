@@ -2087,7 +2087,7 @@ $slot_labels = [
                     </button>
 
                     <button type="submit" name="action_request_submit_mfa" id="submit-btn" <?= $is_backdated_draw ? '' : 'disabled' ?> class="flat-cta" style="cursor: pointer; background: var(--red); color: #fff; border: none; padding: 12px 25px; border-radius: 4px; font-weight: bold; opacity: <?= $is_backdated_draw ? '1' : '0.6' ?>;" title="<?= $is_backdated_draw ? '' : 'Conclude session to enable submission' ?>">
-                        <i class="fa-solid fa-envelope-circle-check"></i> Send MFA Code to Submit
+                        <i class="fa-solid fa-envelope-circle-check"></i> Send for Approval
                     </button>
                 </div>
             <?php else: ?>
