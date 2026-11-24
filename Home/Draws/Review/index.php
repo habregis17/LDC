@@ -500,7 +500,7 @@ include_once __DIR__ . '/../../../assets/includes/sidebar.php';
 
     <div style="background-color: var(--charcoal); color: #ffffff; padding: 20px; border-radius: 4px; margin-bottom: 20px; border-left: 6px solid var(--jade);">
         <h2><i class="fa-solid fa-file-shield"></i> Review &amp; E-Signature Portal</h2>
-        <p style="font-size: 0.85rem; color: var(--pale-charcoal);">Verify draw execution details, review evidence, record approval notes, and issue the official certification.</p>
+        <!-- <p style="font-size: 0.85rem; color: var(--pale-charcoal);">Verify draw execution details, review evidence, record approval notes, and issue the official certification.</p> -->
     </div>
 
     <?php if ($error): ?>
@@ -583,19 +583,23 @@ include_once __DIR__ . '/../../../assets/includes/sidebar.php';
                     </p>
                 <?php endif; ?>
 
-                <?php
-                    $review_photos = [];
-                    if (!empty($draw['central_system_photo'])) {
-                        $raw_p = trim((string)$draw['central_system_photo']);
-                        if (str_starts_with($raw_p, '[')) {
+              <?php
+                $review_photos = [];
+                if (!empty($draw['central_system_photo'])) {
+                    $raw_p = trim((string)$draw['central_system_photo']);
+                    if ($raw_p !== '' && $raw_p !== '[]') {
+                        if (strpos($raw_p, '[') === 0) {
                             $decoded_p = json_decode($raw_p, true);
                             if (is_array($decoded_p)) {
-                                $review_photos = array_values(array_filter($decoded_p));
+                                $review_photos = array_values(array_filter(array_map('trim', $decoded_p), function ($v) {
+                                    return $v !== '';
+                                }));
                             }
                         } else {
                             $review_photos = [$raw_p];
                         }
                     }
+                }
                 ?>
                 <?php if (!empty($review_photos)): ?>
                     <h4 style="color: var(--charcoal); margin-top: 20px; margin-bottom: 10px;">
