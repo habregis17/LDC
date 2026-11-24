@@ -136,11 +136,11 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'upload_snapshot')
             exit;
         }
         if (!isset($_FILES['snapshot_file']) || ($_FILES['snapshot_file']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
-            echo json_encode(['status' => 'error', 'message' => 'No valid image uploaded.']);
+            echo json_encode(['status' => 'error', 'message' => 'No valid image uploaded (check file size or format).']);
             exit;
         }
 
-        $allowed_ext = ['jpg', 'jpeg', 'png', 'webp', 'gif'];
+        $allowed_ext = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif'];
         $orig_name = $_FILES['snapshot_file']['name'] ?? '';
         $tmp_name  = $_FILES['snapshot_file']['tmp_name'] ?? '';
         $ext = strtolower(pathinfo($orig_name, PATHINFO_EXTENSION));
@@ -198,7 +198,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'upload_snapshot')
     exit;
 }
 
-// 0c. AJAX Cross-Device Draft Autosave Endpoint
+// 0c. AJAX Cross-Device Draft Autosave / Save Progress Endpoint
 if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'autosave_draft') {
     ini_set('display_errors', 0);
     error_reporting(0);
@@ -420,7 +420,7 @@ $persist_all_snapshots = function ($draw_id_val, $draw_hash_val, array $current_
         }
     }
 
-    $allowed_ext = ['jpg', 'jpeg', 'png', 'webp', 'gif'];
+    $allowed_ext = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif'];
     $upload_dir = __DIR__ . '/../../../uploads';
     $any_new_upload = false;
 
@@ -466,7 +466,7 @@ $count_attached_snapshots = function (array $paths) {
     return $cnt;
 };
 
-// 1. Handle AJAX Draft Sync on Start Session (also persists drawn numbers)
+// 1. Handle AJAX Draft Sync on Start Session / Save Progress (also persists drawn numbers)
 if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'create_draft') {
     ini_set('display_errors', 0);
     error_reporting(0);
@@ -954,6 +954,18 @@ $slot_labels = [
         font-weight: 700;
         cursor: pointer;
     }
+    .save-progress-btn {
+        background: var(--charcoal);
+        color: #ffffff;
+        border: none;
+        padding: 12px 20px;
+        border-radius: 4px;
+        font-weight: 700;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+    }
     input.date-locked {
         background: #e9ecef !important;
         color: #333;
@@ -1082,7 +1094,6 @@ $slot_labels = [
 
         if (gpsTrackedOnce) return;
 
-        // If already tracked once for this draw, restore and keep locked
         const cachedGps = localStorage.getItem(GPS_LOCK_KEY);
         if (cachedGps && !forceUnlock) {
             try {
@@ -1210,6 +1221,11 @@ $slot_labels = [
                     document.getElementById('draw_id').value = String(data.draw_id || '');
                     if (data.draw_hash_code) {
                         document.getElementById('draw_hash_code').value = String(data.draw_hash_code);
+                        if (window.history && window.history.replaceState) {
+                            const nextUrl = new URL(window.location.href);
+                            nextUrl.searchParams.set('hash', String(data.draw_hash_code));
+                            window.history.replaceState({}, '', nextUrl.toString());
+                        }
                     }
                     document.getElementById('start-session-btn').style.display = 'none';
                     document.getElementById('end-session-btn').disabled = false;
@@ -1276,6 +1292,50 @@ $slot_labels = [
         }
     }
 
+    // Compress large or high-res camera photos client-side so uploads rarely fail on size limits
+    async function prepareImageForUpload(file, maxWidth = 1600, maxBytes = 2 * 1024 * 1024) {
+        if (file.size <= maxBytes && /^image\/(jpeg|png|webp|gif)$/i.test(file.type)) {
+            return file;
+        }
+
+        if (typeof createImageBitmap !== 'function') {
+            return file;
+        }
+
+        try {
+            const bitmap = await createImageBitmap(file);
+            let targetW = bitmap.width;
+            let targetH = bitmap.height;
+
+            if (targetW > maxWidth) {
+                targetH = Math.round((targetH * maxWidth) / targetW);
+                targetW = maxWidth;
+            }
+
+            const canvas = document.createElement('canvas');
+            canvas.width = targetW;
+            canvas.height = targetH;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+            bitmap.close();
+
+            let quality = 0.85;
+            let blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality));
+
+            while (blob && blob.size > maxBytes && quality > 0.5) {
+                quality -= 0.1;
+                blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality));
+            }
+
+            if (!blob) return file;
+
+            const baseName = (file.name || 'snapshot').replace(/\.[^.]+$/, '');
+            return new File([blob], baseName + '.jpg', { type: 'image/jpeg' });
+        } catch (e) {
+            return file;
+        }
+    }
+
     // Dedicated camera trigger (rear camera) while file input stays open for gallery/files
     function triggerInstantCamera(slotIdx) {
         const camInp = document.getElementById('snapshot_cam_' + slotIdx);
@@ -1295,7 +1355,6 @@ $slot_labels = [
         const mainFileInp = document.getElementById('snapshot_file_' + slotIdx);
         const camInp = document.getElementById('snapshot_cam_' + slotIdx);
 
-        // If captured via the camera button, copy into the main file input so PHP POST receives it too
         if (camInp && sourceInput === camInp && mainFileInp && typeof DataTransfer !== 'undefined') {
             const dt = new DataTransfer();
             dt.items.add(file);
@@ -1335,7 +1394,7 @@ $slot_labels = [
         counterEl.style.color = (count === REQUIRED_SNAPSHOTS) ? 'var(--jade)' : 'var(--burgundy)';
     }
 
-    function previewSnapshotSlot(input, slotIdx) {
+    async function previewSnapshotSlot(input, slotIdx) {
         const box = document.getElementById('snapshot_preview_box_' + slotIdx);
         const img = document.getElementById('snapshot_preview_img_' + slotIdx);
         const cap = document.getElementById('snapshot_preview_cap_' + slotIdx);
@@ -1346,7 +1405,15 @@ $slot_labels = [
             return;
         }
 
-        const file = input.files[0];
+        const rawFile = input.files[0];
+        const file = await prepareImageForUpload(rawFile);
+
+        if (typeof DataTransfer !== 'undefined' && file !== rawFile) {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            input.files = dt.files;
+        }
+
         const reader = new FileReader();
         reader.onload = function(e) {
             if (img) img.src = e.target.result;
@@ -1359,7 +1426,7 @@ $slot_labels = [
         const drawHash = (document.getElementById('draw_hash_code')?.value || '').trim();
 
         if (!drawId && !drawHash) {
-            if (cap) cap.textContent = file.name + ' (attached locally; start session or submit to store)';
+            if (cap) cap.textContent = file.name + ' (attached locally; click Save Progress or Start Session to store)';
             refreshSnapshotCounter();
             return;
         }
@@ -1371,20 +1438,20 @@ $slot_labels = [
         fd.append('draw_hash_code', drawHash);
         fd.append('snapshot_file', file);
 
-        fetch(window.location.href, {
-            method: 'POST',
-            body: fd,
-            credentials: 'same-origin'
-        })
-        .then(async res => {
+        try {
+            const res = await fetch(window.location.href, {
+                method: 'POST',
+                body: fd,
+                credentials: 'same-origin'
+            });
             const txt = await res.text();
+            let data;
             try {
-                return JSON.parse(txt);
+                data = JSON.parse(txt);
             } catch (e) {
                 throw new Error(txt.substring(0, 140) || 'Invalid upload response');
             }
-        })
-        .then(data => {
+
             if (data.status === 'success' && Array.isArray(data.photos)) {
                 if (hiddenJson) hiddenJson.value = JSON.stringify(data.photos);
                 if (img && data.url) img.src = data.url;
@@ -1395,11 +1462,10 @@ $slot_labels = [
             } else {
                 throw new Error(data.message || 'Upload failed');
             }
-        })
-        .catch(err => {
+        } catch (err) {
             if (cap) cap.textContent = file.name + ' (upload error: ' + err.message + ')';
             refreshSnapshotCounter();
-        });
+        }
     }
 
     function saveFormBackup() {
@@ -1426,12 +1492,12 @@ $slot_labels = [
         localStorage.setItem(STORAGE_KEY, JSON.stringify(formObj));
     }
 
-    function syncDraftToServer() {
+    async function syncDraftToServer() {
         const drawId = (document.getElementById('draw_id')?.value || '').trim();
         const drawHash = (document.getElementById('draw_hash_code')?.value || '').trim();
         const noticeEl = document.getElementById('session-saved-notice');
 
-        if (!drawId && !drawHash) return;
+        if (!drawId && !drawHash) return null;
 
         const fd = new FormData();
         fd.append('ajax_action', 'autosave_draft');
@@ -1463,25 +1529,24 @@ $slot_labels = [
             noticeEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Syncing draft...';
         }
 
-        fetch(window.location.href, {
-            method: 'POST',
-            body: fd,
-            credentials: 'same-origin'
-        })
-        .then(async res => {
+        try {
+            const res = await fetch(window.location.href, {
+                method: 'POST',
+                body: fd,
+                credentials: 'same-origin'
+            });
             const txt = await res.text();
-            return JSON.parse(txt);
-        })
-        .then(data => {
+            const data = JSON.parse(txt);
             if (data.status === 'success' && noticeEl) {
                 noticeEl.innerHTML = '<i class="fa-solid fa-cloud-check" style="color: var(--jade);"></i> Draft synced at ' + data.saved_at;
             }
-        })
-        .catch(() => {
+            return data;
+        } catch (err) {
             if (noticeEl) {
                 noticeEl.innerHTML = '<i class="fa-solid fa-triangle-exclamation" style="color: var(--gold);"></i> Offline/sync pending';
             }
-        });
+            throw err;
+        }
     }
 
     function scheduleServerAutosave(delayMs = 700) {
@@ -1492,21 +1557,95 @@ $slot_labels = [
 
         clearTimeout(dbAutosaveTimer);
         if (delayMs <= 0) {
-            syncDraftToServer();
+            syncDraftToServer().catch(() => {});
         } else {
-            dbAutosaveTimer = setTimeout(syncDraftToServer, delayMs);
+            dbAutosaveTimer = setTimeout(() => {
+                syncDraftToServer().catch(() => {});
+            }, delayMs);
+        }
+    }
+
+    async function saveProgressNow() {
+        const noticeEl = document.getElementById('session-saved-notice');
+        const saveBtn = document.getElementById('save-progress-btn');
+        const chosenDate = (document.getElementById('draw_date')?.value || TODAY_DATE).trim();
+        const sessionName = (document.querySelector('input[name="draw_session"]')?.value || '').trim() || 'Draft Session';
+
+        saveFormBackup();
+        if (saveBtn) saveBtn.disabled = true;
+        if (noticeEl) {
+            noticeEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving progress...';
+        }
+
+        try {
+            let drawId = (document.getElementById('draw_id')?.value || '').trim();
+            let drawHash = (document.getElementById('draw_hash_code')?.value || '').trim();
+
+            if (!drawId && !drawHash) {
+                const cfd = new FormData();
+                cfd.append('ajax_action', 'create_draft');
+                cfd.append('draw_date', chosenDate);
+                cfd.append('draw_session', sessionName);
+                cfd.append('start_time', document.getElementById('start_time')?.value || '00:00:00');
+                for (let i = 1; i <= 5; i++) {
+                    cfd.append('n' + i + '_a', document.getElementById('seta_n' + i)?.value || '');
+                    cfd.append('n' + i + '_b', document.getElementById('setb_n' + i)?.value || '');
+                }
+
+                const cres = await fetch(window.location.href, {
+                    method: 'POST',
+                    body: cfd,
+                    credentials: 'same-origin'
+                });
+                const cdata = JSON.parse(await cres.text());
+                if (cdata.status !== 'success') {
+                    throw new Error(cdata.message || 'Could not initialize draft');
+                }
+
+                drawId = String(cdata.draw_id || '');
+                drawHash = String(cdata.draw_hash_code || '');
+                document.getElementById('draw_id').value = drawId;
+                document.getElementById('draw_hash_code').value = drawHash;
+
+                if (drawHash && window.history && window.history.replaceState) {
+                    const nextUrl = new URL(window.location.href);
+                    nextUrl.searchParams.set('hash', drawHash);
+                    window.history.replaceState({}, '', nextUrl.toString());
+                }
+            }
+
+            for (let s = 0; s < REQUIRED_SNAPSHOTS; s++) {
+                const inp = document.getElementById('snapshot_file_' + s);
+                if (inp && inp.files && inp.files[0]) {
+                    await previewSnapshotSlot(inp, s);
+                }
+            }
+
+            clearTimeout(dbAutosaveTimer);
+            const savedData = await syncDraftToServer();
+
+            if (noticeEl) {
+                const stamp = (savedData && savedData.saved_at) ? ' at ' + savedData.saved_at : '';
+                noticeEl.innerHTML = '<i class="fa-solid fa-floppy-disk" style="color: var(--jade);"></i> Progress saved' + stamp + ' — safe to continue later or on another device.';
+            }
+        } catch (err) {
+            if (noticeEl) {
+                noticeEl.innerHTML = '<i class="fa-solid fa-triangle-exclamation" style="color: var(--red);"></i> Save failed: ' + err.message;
+            }
+        } finally {
+            if (saveBtn) saveBtn.disabled = false;
         }
     }
 
     window.addEventListener('pagehide', function() {
         clearTimeout(dbAutosaveTimer);
-        syncDraftToServer();
+        syncDraftToServer().catch(() => {});
     });
 
     document.addEventListener('visibilitychange', function() {
         if (document.hidden) {
             clearTimeout(dbAutosaveTimer);
-            syncDraftToServer();
+            syncDraftToServer().catch(() => {});
         }
     });
 
@@ -1555,7 +1694,6 @@ $slot_labels = [
                     if (el && !el.checked) el.checked = data.chk_post;
                 }
 
-                // Restore Set A & Set B numbers when empty or when DB has no non-zero numbers yet
                 if (Array.isArray(data.seta)) {
                     data.seta.forEach((val, idx) => {
                         const inp = document.getElementById('seta_n' + (idx + 1));
@@ -1590,7 +1728,6 @@ $slot_labels = [
             }
         }
 
-        // Track GPS once (or restore locked GPS)
         captureLocation(true, false);
 
         if (IS_DATE_LOCKED || document.getElementById('draw_date')?.value) {
@@ -1888,7 +2025,7 @@ $slot_labels = [
                     </span>
                 </div>
                 <p style="font-size: 0.76rem; color: var(--slate); margin: 4px 0 8px;">
-                    Choose an image from your gallery/files or tap <strong>Take Photo</strong> to snap directly with your camera. Each photo saves automatically so refreshing won't lose it.
+                    Choose an image from your gallery/files or tap <strong>Take Photo</strong> to snap directly with your camera. Large images are automatically compressed before upload so they save smoothly.
                 </p>
 
                 <div class="snapshots-grid">
@@ -1905,7 +2042,6 @@ $slot_labels = [
                                     </button>
                                 </div>
 
-                                <!-- Standard gallery / file picker (no capture attribute) -->
                                 <input type="file"
                                        name="central_photos[<?= $s ?>]"
                                        id="snapshot_file_<?= $s ?>"
@@ -1914,7 +2050,6 @@ $slot_labels = [
                                        <?= $slot_saved === '' ? 'required' : '' ?>
                                        style="width: 100%; font-size: 0.76rem;">
 
-                                <!-- Dedicated rear-camera input -->
                                 <input type="file"
                                        id="snapshot_cam_<?= $s ?>"
                                        accept="image/*"
@@ -1941,17 +2076,32 @@ $slot_labels = [
                 <textarea name="procedure_notes" rows="2" placeholder="Verification Conclusion" style="width: 100%; padding: 8px; border: 1px solid var(--pale-charcoal); margin-top: 4px;"><?= htmlspecialchars($val_notes) ?></textarea>
             </div>
 
-            <!-- MFA Step 1 vs Step 2 Submission Controls -->
+            <!-- Save Progress + MFA Step 1 vs Step 2 Submission Controls -->
             <?php if ($mfa_step === 1): ?>
-                <button type="submit" name="action_request_submit_mfa" id="submit-btn" <?= $is_backdated_draw ? '' : 'disabled' ?> class="flat-cta" style="cursor: pointer; background: var(--red); color: #fff; border: none; padding: 12px 25px; border-radius: 4px; font-weight: bold; opacity: <?= $is_backdated_draw ? '1' : '0.6' ?>;" title="<?= $is_backdated_draw ? '' : 'Conclude session to enable submission' ?>">
-                    <i class="fa-solid fa-envelope-circle-check"></i> Send MFA Code to Submit
-                </button>
+                <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
+                    <button type="button"
+                            id="save-progress-btn"
+                            onclick="saveProgressNow()"
+                            class="save-progress-btn">
+                        <i class="fa-solid fa-floppy-disk"></i> Save Progress
+                    </button>
+
+                    <button type="submit" name="action_request_submit_mfa" id="submit-btn" <?= $is_backdated_draw ? '' : 'disabled' ?> class="flat-cta" style="cursor: pointer; background: var(--red); color: #fff; border: none; padding: 12px 25px; border-radius: 4px; font-weight: bold; opacity: <?= $is_backdated_draw ? '1' : '0.6' ?>;" title="<?= $is_backdated_draw ? '' : 'Conclude session to enable submission' ?>">
+                        <i class="fa-solid fa-envelope-circle-check"></i> Send MFA Code to Submit
+                    </button>
+                </div>
             <?php else: ?>
                 <div style="background: #f4f6f9; border: 1px solid var(--pale-charcoal); border-left: 4px solid var(--red); padding: 16px; border-radius: 4px; max-width: 440px;">
                     <label style="font-size: 0.85rem; font-weight: 700; color: var(--charcoal);">Enter 6-Digit Submission MFA Code</label>
                     <p style="font-size: 0.78rem; color: var(--slate); margin: 4px 0 8px;">Check your email for the 6-digit security code to finalize submission.</p>
                     <input type="text" name="submit_mfa_code" maxlength="6" inputmode="numeric" pattern="[0-9]*" required placeholder="000000" style="width: 100%; padding: 10px; border: 1px solid var(--pale-charcoal); border-radius: 4px; text-align: center; font-size: 1.2rem; letter-spacing: 5px; font-weight: 700;">
-                    <div style="display: flex; gap: 10px; margin-top: 12px;">
+                    <div style="display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap;">
+                        <button type="button"
+                                id="save-progress-btn"
+                                onclick="saveProgressNow()"
+                                class="save-progress-btn">
+                            <i class="fa-solid fa-floppy-disk"></i> Save Progress
+                        </button>
                         <button type="submit" name="action_confirm_submit" style="background: var(--jade); color: #fff; border: none; padding: 11px 18px; border-radius: 4px; font-weight: bold; cursor: pointer;">
                             <i class="fa-solid fa-paper-plane"></i> Verify MFA &amp; Submit Draw
                         </button>
